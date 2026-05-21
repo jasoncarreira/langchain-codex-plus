@@ -8,13 +8,18 @@ from __future__ import annotations
 
 from langchain_codex_plus.codex_auth import (
     CODEX_API_BASE,
+    CODEX_OAUTH_CLIENT_ID,
+    REFRESH_TOKEN_URL,
     CodexAuth,
     CodexAuthInvalidError,
     CodexAuthNotFoundError,
+    CodexAuthRefreshError,
+    arefresh_codex_auth,
     auth_file_path,
     codex_home,
     is_likely_expired,
     load_codex_auth,
+    refresh_codex_auth,
 )
 from langchain_codex_plus.codex_chat_model import ChatCodexPlus
 from langchain_codex_plus.codex_protocol import (
@@ -40,13 +45,18 @@ __version__ = "0.0.1"
 __all__ = [
     # codex_auth
     "CODEX_API_BASE",
+    "CODEX_OAUTH_CLIENT_ID",
+    "REFRESH_TOKEN_URL",
     "CodexAuth",
     "CodexAuthInvalidError",
     "CodexAuthNotFoundError",
+    "CodexAuthRefreshError",
+    "arefresh_codex_auth",
     "auth_file_path",
     "codex_home",
     "is_likely_expired",
     "load_codex_auth",
+    "refresh_codex_auth",
     # codex_protocol
     "CodexCompletion",
     "CodexResponseError",

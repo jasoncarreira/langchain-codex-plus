@@ -384,12 +384,15 @@ async def test_astream_yields_chunks(auth_file):
 
 @pytest.mark.asyncio
 async def test_agenerate_raises_on_http_error(auth_file):
+    """401 surfacing path with ``auto_refresh=False`` — refresh is
+    disabled so the original error bubbles up unchanged. The
+    auto-refresh + retry behavior is covered in test_oauth_refresh."""
     transport = _AsyncCaptureTransport(
         status_code=401,
         body=b'{"detail":"Invalid bearer token"}',
         headers={"Content-Type": "application/json"},
     )
-    llm = _make_llm(auth_file, transport=transport)
+    llm = _make_llm(auth_file, transport=transport, auto_refresh=False)
     with pytest.raises(CodexResponseError) as exc:
         await llm.ainvoke([HumanMessage("hi")])
     assert "HTTP 401" in str(exc.value)

@@ -56,9 +56,13 @@ Note: Codex may keep generating tokens server-side until we close —
 on a subscription account this is a window-utilization cost only,
 not a per-token billing cost.
 
-Not yet supported (planned follow-ups):
-
-* **Token refresh** — relies on the user re-authing via Codex CLI.
+OAuth refresh: when ``auto_refresh=True`` (the default), a 401
+response triggers a refresh against ``auth.openai.com/oauth/token``
+using the stored ``refresh_token``. New tokens are written back to
+``auth.json`` atomically (``.tmp``-then-rename) and the original
+call is retried once. Permanent failures (refresh_token expired /
+revoked / already-used) surface as :class:`CodexAuthRefreshError`
+with ``permanent=True`` — the operator must re-run ``codex login``.
 """
 from __future__ import annotations
 
@@ -86,7 +90,9 @@ from langchain_codex_plus.codex_auth import (
     CODEX_API_BASE,
     CodexAuth,
     CodexAuthNotFoundError,
+    arefresh_codex_auth,
     load_codex_auth,
+    refresh_codex_auth,
 )
 from langchain_codex_plus.codex_protocol import (
     CodexCompletion,
@@ -211,6 +217,16 @@ class ChatCodexPlus(BaseChatModel):
             "Default False (don't bloat history)."
         ),
     )
+    auto_refresh: bool = Field(
+        default=True,
+        description=(
+            "When True (default), a 401 response triggers an OAuth "
+            "refresh against the ChatGPT token endpoint, after which "
+            "the call is retried once. Permanent refresh failures "
+            "(expired/revoked refresh_token) surface as a "
+            "``CodexAuthRefreshError``."
+        ),
+    )
     tools: list[dict[str, Any]] | None = Field(
         default=None,
         description=(
@@ -312,6 +328,25 @@ class ChatCodexPlus(BaseChatModel):
         )
 
     # ─── Auth ───────────────────────────────────────────────────────────
+
+    def _refresh_auth_sync(self) -> CodexAuth:
+        """Refresh the OAuth tokens via the ChatGPT token endpoint
+        and update the cached auth. Raises :class:`CodexAuthRefreshError`
+        on failure — permanent failures (expired/reused refresh_token)
+        require the operator to re-run ``codex login``."""
+        current = self._resolve_auth()
+        new_auth = refresh_codex_auth(current, path=self.auth_file_path)
+        self._auth = new_auth
+        return new_auth
+
+    async def _refresh_auth_async(self) -> CodexAuth:
+        """Async sibling of :meth:`_refresh_auth_sync`."""
+        current = self._resolve_auth()
+        new_auth = await arefresh_codex_auth(
+            current, path=self.auth_file_path
+        )
+        self._auth = new_auth
+        return new_auth
 
     def _resolve_auth(self, *, force_reload: bool = False) -> CodexAuth:
         """Load ``auth.json`` (cached). Raises if no OAuth bundle is
@@ -473,14 +508,29 @@ class ChatCodexPlus(BaseChatModel):
             tools_override=kwargs.get("tools"),
             tool_choice_override=kwargs.get("tool_choice"),
         )
+        max_attempts = 2 if self.auto_refresh else 1
         with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = self._post_stream_sync(client, auth, body)
-            try:
-                self._raise_for_http_error(response)
-                self._fire_rate_limit_callback(response.headers)
-                completion = self._consume_sync(response, run_manager, stop=stop)
-            finally:
-                response.close()
+            for attempt in range(max_attempts):
+                response = self._post_stream_sync(client, auth, body)
+                try:
+                    if (
+                        response.status_code == 401
+                        and attempt < max_attempts - 1
+                    ):
+                        # Drain + close before triggering refresh so
+                        # the connection returns cleanly to the pool.
+                        response.read()
+                        response.close()
+                        auth = self._refresh_auth_sync()
+                        continue
+                    self._raise_for_http_error(response)
+                    self._fire_rate_limit_callback(response.headers)
+                    completion = self._consume_sync(
+                        response, run_manager, stop=stop
+                    )
+                    break
+                finally:
+                    response.close()
         message = self._completion_to_ai_message(completion)
         return ChatResult(generations=[ChatGeneration(message=message)])
 
@@ -555,18 +605,29 @@ class ChatCodexPlus(BaseChatModel):
             tools_override=kwargs.get("tools"),
             tool_choice_override=kwargs.get("tool_choice"),
         )
+        max_attempts = 2 if self.auto_refresh else 1
         with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = self._post_stream_sync(client, auth, body)
-            try:
-                self._raise_for_http_error(response)
-                self._fire_rate_limit_callback(response.headers)
-                yield from _yield_chunks_sync(
-                    parse_sse_stream(response.iter_lines()),
-                    run_manager=run_manager,
-                    stop=stop,
-                )
-            finally:
-                response.close()
+            for attempt in range(max_attempts):
+                response = self._post_stream_sync(client, auth, body)
+                try:
+                    if (
+                        response.status_code == 401
+                        and attempt < max_attempts - 1
+                    ):
+                        response.read()
+                        response.close()
+                        auth = self._refresh_auth_sync()
+                        continue
+                    self._raise_for_http_error(response)
+                    self._fire_rate_limit_callback(response.headers)
+                    yield from _yield_chunks_sync(
+                        parse_sse_stream(response.iter_lines()),
+                        run_manager=run_manager,
+                        stop=stop,
+                    )
+                    return
+                finally:
+                    response.close()
 
     # ─── Async path: _agenerate ─────────────────────────────────────────
 
@@ -588,16 +649,27 @@ class ChatCodexPlus(BaseChatModel):
             tools_override=kwargs.get("tools"),
             tool_choice_override=kwargs.get("tool_choice"),
         )
+        max_attempts = 2 if self.auto_refresh else 1
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await self._post_stream_async(client, auth, body)
-            try:
-                await self._araise_for_http_error(response)
-                self._fire_rate_limit_callback(response.headers)
-                completion = await self._consume_async(
-                    response, run_manager, stop=stop
-                )
-            finally:
-                await response.aclose()
+            for attempt in range(max_attempts):
+                response = await self._post_stream_async(client, auth, body)
+                try:
+                    if (
+                        response.status_code == 401
+                        and attempt < max_attempts - 1
+                    ):
+                        await response.aread()
+                        await response.aclose()
+                        auth = await self._refresh_auth_async()
+                        continue
+                    await self._araise_for_http_error(response)
+                    self._fire_rate_limit_callback(response.headers)
+                    completion = await self._consume_async(
+                        response, run_manager, stop=stop
+                    )
+                    break
+                finally:
+                    await response.aclose()
         message = self._completion_to_ai_message(completion)
         return ChatResult(generations=[ChatGeneration(message=message)])
 
@@ -687,8 +759,22 @@ class ChatCodexPlus(BaseChatModel):
             tools_override=kwargs.get("tools"),
             tool_choice_override=kwargs.get("tool_choice"),
         )
+        max_attempts = 2 if self.auto_refresh else 1
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await self._post_stream_async(client, auth, body)
+            for attempt in range(max_attempts):
+                response = await self._post_stream_async(client, auth, body)
+                if (
+                    response.status_code == 401
+                    and attempt < max_attempts - 1
+                ):
+                    await response.aread()
+                    await response.aclose()
+                    auth = await self._refresh_auth_async()
+                    continue
+                # Success path: break out of the retry loop and proceed
+                # to the SSE-consumption block below. ``response`` is
+                # left open for ``aiter_lines`` use.
+                break
             try:
                 await self._araise_for_http_error(response)
                 self._fire_rate_limit_callback(response.headers)
