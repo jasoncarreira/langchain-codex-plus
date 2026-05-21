@@ -1,0 +1,53 @@
+name: Publish to PyPI
+
+# Triggered by pushing a version tag (e.g. ``v0.0.1``). PyPI Trusted
+# Publishing uses GitHub's OIDC token to authenticate — no API tokens
+# stored anywhere. The ``pypi`` environment adds an extra gate (you
+# can require manual approval on it in the repo settings).
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  publish:
+    name: Publish to PyPI (trusted publishing)
+    needs: build
+    runs-on: ubuntu-latest
+    # Must match the environment name configured on the PyPI pending
+    # publisher. If you skipped the environment field there, remove
+    # this line.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/langchain-codex-plus
+    permissions:
+      # Required for trusted publishing — PyPI verifies the GH OIDC
+      # token, which only this job is allowed to mint.
+      id-token: write
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
