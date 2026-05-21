@@ -34,9 +34,18 @@ with ``tool_call_id`` matching the original ``call_id`` — the
 protocol layer transparently serializes them as ``function_call_output``
 input entries.
 
+Multimodal: ``HumanMessage`` content can be a list mixing text and
+image blocks; the protocol layer maps them to Codex's ``input_text``
++ ``input_image`` content blocks. Accepted image-block shapes:
+
+* ``{"type": "image_url", "image_url": "https://..."}``
+* ``{"type": "image_url", "image_url": {"url": ..., "detail": ...}}``
+* ``{"type": "image", "source_type": "url", "url": ...}``
+* ``{"type": "image", "source_type": "base64", "data": ...,
+  "mime_type": "image/png"}`` (encoded as a ``data:`` URL)
+
 Not yet supported (planned follow-ups):
 
-* **Image / multimodal input** — text only for v0.1.
 * **Stop sequences** — Codex Responses API doesn't expose them; the
   ``stop`` argument is currently ignored.
 * **Token refresh** — relies on the user re-authing via Codex CLI.

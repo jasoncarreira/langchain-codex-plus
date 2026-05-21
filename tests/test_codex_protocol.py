@@ -141,18 +141,24 @@ def test_build_body_extra_can_override_store_flag():
     assert body["store"] is True
 
 
-def test_build_body_multimodal_content_blocks_extract_text():
-    """LangChain content can be a list of blocks. We extract text
-    blocks and join; image blocks are dropped silently (multimodal
-    is a follow-up)."""
+def test_build_body_multimodal_content_blocks_preserved():
+    """Multi-block content with an image between text fragments
+    surfaces as three Codex blocks (text → image → text) — the
+    text doesn't collapse across the image. See ``test_multimodal``
+    for the full set of accepted image-block shapes."""
     msg = HumanMessage(content=[
         {"type": "text", "text": "describe this"},
         {"type": "image_url", "image_url": "https://example.com/x.png"},
         {"type": "text", "text": " in detail"},
     ])
     body = build_request_body([msg], model="gpt-5.4")
-    # Two text fragments concatenated.
-    assert body["input"][0]["content"][0]["text"] == "describe this in detail"
+    blocks = body["input"][0]["content"]
+    assert [b["type"] for b in blocks] == [
+        "input_text", "input_image", "input_text",
+    ]
+    assert blocks[0]["text"] == "describe this"
+    assert blocks[1]["image_url"] == "https://example.com/x.png"
+    assert blocks[2]["text"] == " in detail"
 
 
 # ─── parse_sse_stream ───────────────────────────────────────────────────

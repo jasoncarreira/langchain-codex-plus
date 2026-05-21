@@ -61,29 +61,19 @@ def _message_to_input_entries(message: Any) -> list[dict[str, Any]]:
     if role == "system":
         return []
     if role == "human":
-        return [
-            {
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": _coerce_message_content_to_text(message),
-                }],
-            }
-        ]
+        blocks = _coerce_to_codex_blocks(message, role="user")
+        if not blocks:
+            return []
+        return [{"role": "user", "content": blocks}]
     if role == "ai":
         return _ai_message_to_entries(message)
     if role == "tool":
         return [_tool_message_to_function_call_output(message)]
     # Unknown message type — pass as user. Better visible than silent.
-    return [
-        {
-            "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": _coerce_message_content_to_text(message),
-            }],
-        }
-    ]
+    blocks = _coerce_to_codex_blocks(message, role="user")
+    if not blocks:
+        return []
+    return [{"role": "user", "content": blocks}]
 
 
 def _ai_message_to_entries(message: Any) -> list[dict[str, Any]]:
@@ -105,12 +95,12 @@ def _ai_message_to_entries(message: Any) -> list[dict[str, Any]]:
     JSON for the wire.
     """
     entries: list[dict[str, Any]] = []
-    text = _coerce_message_content_to_text(message)
-    if text:
-        entries.append({
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text}],
-        })
+    # Assistant messages emit ``output_text`` blocks (no images — Codex
+    # doesn't accept image content in assistant turns; the model
+    # doesn't generate them anyway).
+    blocks = _coerce_to_codex_blocks(message, role="assistant")
+    if blocks:
+        entries.append({"role": "assistant", "content": blocks})
     for tc in getattr(message, "tool_calls", None) or []:
         # ToolCall is a TypedDict in newer langchain-core; both
         # attribute and item access work via dict lookup on TypedDict
@@ -146,13 +136,14 @@ def _tool_message_to_function_call_output(message: Any) -> dict[str, Any]:
 
 
 def _coerce_message_content_to_text(message: Any) -> str:
-    """LangChain messages can have either ``str`` content or a list
-    of content-block dicts. Flatten to a single string for Codex
-    ``input_text`` / ``output_text``.
+    """Flatten a LangChain message's content to a single string.
 
-    Multimodal (images, etc.) is dropped here — Codex Responses API
-    accepts ``input_image`` but mapping LangChain image blocks is
-    deferred to a follow-up since the wrapping conventions vary.
+    Used by call sites that need a string (``instructions`` field,
+    ``function_call_output.output``). Image blocks are dropped here
+    by design — those contexts don't accept multimodal content.
+
+    For preserving multimodal content into Codex content blocks, see
+    :func:`_coerce_to_codex_blocks` instead.
     """
     content = getattr(message, "content", "")
     if isinstance(content, str):
@@ -168,6 +159,147 @@ def _coerce_message_content_to_text(message: Any) -> str:
                     parts.append(text)
         return "".join(parts)
     return str(content) if content is not None else ""
+
+
+# Codex ``ImageDetail`` from app-server-protocol/ContentItem.ts.
+_VALID_IMAGE_DETAILS = frozenset({"auto", "low", "high"})
+
+
+def _coerce_to_codex_blocks(
+    message: Any, *, role: str
+) -> list[dict[str, Any]]:
+    """Convert a LangChain message's content to Codex content blocks.
+
+    Codex's content schema (``ContentItem.ts``):
+
+    * ``{"type": "input_text", "text": <str>}`` — user / tool input
+    * ``{"type": "input_image", "image_url": <url-or-data-url>,
+      "detail"?: "auto" | "low" | "high"}`` — image input
+    * ``{"type": "output_text", "text": <str>}`` — assistant output
+
+    Accepted LangChain image-block conventions:
+
+    1. ``{"type": "image_url", "image_url": <url-string>}``
+    2. ``{"type": "image_url", "image_url": {"url": ..., "detail": ...}}``
+    3. ``{"type": "image", "source_type": "url", "url": ...}``
+    4. ``{"type": "image", "source_type": "base64", "data": ...,
+       "mime_type": "image/png"}`` — encoded as ``data:`` URL
+
+    The ``role`` parameter picks the text-block type: ``"user"`` /
+    ``"tool"`` → ``input_text``, ``"assistant"`` → ``output_text``.
+    Image blocks always serialize to ``input_image`` (Codex doesn't
+    expose an output_image type — the assistant turn never carries
+    images, so we drop image blocks on assistant content with a debug
+    log path via the no-op).
+
+    Returns ``[]`` for genuinely empty content — caller decides
+    whether to drop the message entirely or treat empty as a no-op.
+    """
+    text_type = "output_text" if role == "assistant" else "input_text"
+    content = getattr(message, "content", "")
+    blocks: list[dict[str, Any]] = []
+    if isinstance(content, str):
+        if content:
+            blocks.append({"type": text_type, "text": content})
+        return blocks
+    if not isinstance(content, list):
+        # Defensive — coerce odd shapes (e.g., Pydantic models) to str.
+        s = str(content) if content is not None else ""
+        if s:
+            blocks.append({"type": text_type, "text": s})
+        return blocks
+
+    accumulated_text: list[str] = []
+
+    def _flush_text() -> None:
+        """Coalesce adjacent text fragments into a single block. The
+        caller-visible content stays a one-text-block + N-image-blocks
+        list, not an explosion of single-character text blocks."""
+        if accumulated_text:
+            joined = "".join(accumulated_text)
+            if joined:
+                blocks.append({"type": text_type, "text": joined})
+            accumulated_text.clear()
+
+    for block in content:
+        if isinstance(block, str):
+            accumulated_text.append(block)
+            continue
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text" or ("text" in block and "type" not in block):
+            text = block.get("text")
+            if isinstance(text, str):
+                accumulated_text.append(text)
+            continue
+        # Multimodal: image variants. Only accept on non-assistant roles.
+        if role == "assistant":
+            # Codex doesn't accept image blocks in assistant content;
+            # silently drop them rather than emit a malformed entry.
+            continue
+        image_block = _try_extract_image_block(block, btype)
+        if image_block is not None:
+            _flush_text()
+            blocks.append(image_block)
+            continue
+        # Unknown block type with a text-ish field — last-ditch fallback
+        # so a stray ``{"type": "custom", "text": "..."}`` doesn't get
+        # dropped silently.
+        fallback = block.get("text") or block.get("content")
+        if isinstance(fallback, str):
+            accumulated_text.append(fallback)
+
+    _flush_text()
+    return blocks
+
+
+def _try_extract_image_block(
+    block: dict[str, Any], btype: str | None
+) -> dict[str, Any] | None:
+    """Map a LangChain image block to a Codex ``input_image`` block.
+
+    Returns ``None`` if the block isn't an image variant or doesn't
+    carry the URL/data needed to construct one.
+    """
+    # Convention 1 / 2: ``{"type": "image_url", "image_url": <str|dict>}``
+    if btype == "image_url":
+        iu = block.get("image_url")
+        if isinstance(iu, str) and iu:
+            return {"type": "input_image", "image_url": iu}
+        if isinstance(iu, dict):
+            url = iu.get("url")
+            if not isinstance(url, str) or not url:
+                return None
+            out: dict[str, Any] = {"type": "input_image", "image_url": url}
+            detail = iu.get("detail")
+            if isinstance(detail, str) and detail in _VALID_IMAGE_DETAILS:
+                out["detail"] = detail
+            return out
+        return None
+    # Convention 3 / 4: ``{"type": "image", "source_type": ..., ...}``
+    if btype == "image":
+        source_type = block.get("source_type")
+        if source_type == "url":
+            url = block.get("url")
+            if isinstance(url, str) and url:
+                out = {"type": "input_image", "image_url": url}
+                detail = block.get("detail")
+                if isinstance(detail, str) and detail in _VALID_IMAGE_DETAILS:
+                    out["detail"] = detail
+                return out
+            return None
+        if source_type == "base64":
+            data = block.get("data")
+            mime = block.get("mime_type") or "image/png"
+            if isinstance(data, str) and data:
+                return {
+                    "type": "input_image",
+                    "image_url": f"data:{mime};base64,{data}",
+                }
+            return None
+        return None
+    return None
 
 
 def _extract_instructions(messages: Iterable[Any]) -> str:
