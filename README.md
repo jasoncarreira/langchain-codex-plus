@@ -31,7 +31,7 @@ the way you'd use `ChatOpenAI` or `ChatAnthropic`.
 
 ## Status
 
-Alpha. v0.0.1.
+Alpha. v0.0.1. 134 tests + a gated real-account smoke test pass.
 
 ## Auth
 
@@ -46,8 +46,63 @@ llm = ChatCodexPlus(model="gpt-5.4")
 llm.invoke("Say ok.")
 ```
 
-If `auth.json` doesn't exist, init raises with a hint to run
-`codex login`.
+When the access token expires (~1h TTL), a 401 response triggers an
+automatic refresh against `auth.openai.com/oauth/token`, then the
+call retries once. Permanent refresh failures (expired / revoked /
+already-used refresh token) raise `CodexAuthRefreshError` with
+`permanent=True` — the operator must re-run `codex login`. Opt out
+with `auto_refresh=False` if you want to handle 401s yourself.
+
+## Tool calling
+
+Use `bind_tools` exactly like `ChatOpenAI.bind_tools`:
+
+```python
+from langchain_core.tools import tool
+from langchain_codex_plus import ChatCodexPlus
+
+@tool
+def get_weather(location: str) -> str:
+    """Look up the weather."""
+    return f"sunny in {location}"
+
+llm = ChatCodexPlus().bind_tools([get_weather])
+msg = llm.invoke("Weather in Boston?")
+# msg.tool_calls → [{"name": "get_weather", "args": {"location": "Boston"}, "id": "call_..."}]
+```
+
+Send tool results back via `ToolMessage(content=..., tool_call_id=...)` —
+the protocol layer serializes them as Codex `function_call_output`
+entries.
+
+## Multimodal
+
+`HumanMessage` content can be a list mixing text and image blocks:
+
+```python
+from langchain_core.messages import HumanMessage
+
+llm.invoke([HumanMessage(content=[
+    {"type": "text", "text": "What's in this image?"},
+    {"type": "image_url", "image_url": "https://example.com/cat.png"},
+])])
+```
+
+Both LangChain image-block conventions are accepted (`{type: image_url,
+image_url: {url, detail}}` and `{type: image, source_type: "url"|"base64",
+...}`). Base64 data is auto-encoded as a `data:` URL.
+
+## Stop sequences
+
+Codex's `/codex/responses` rejects the `stop` parameter, so we match
+client-side. Streaming uses a buffered matcher so stop sequences
+split across SSE chunks (the common tokenization case) still
+truncate cleanly:
+
+```python
+llm.invoke("Count from 1 to 100", stop=["50"])
+# → "1, 2, 3, ... 49, "
+```
 
 ## Rate-limit hook
 
@@ -64,6 +119,9 @@ def on_rate_limits(rl: CodexRateLimits) -> None:
 
 llm = ChatCodexPlus(model="gpt-5.4", rate_limit_callback=on_rate_limits)
 ```
+
+Callback exceptions are caught and logged — they never break the
+response path.
 
 ## License
 
