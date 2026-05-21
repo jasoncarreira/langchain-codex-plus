@@ -25,10 +25,17 @@ headers (5h + 7d windows, plan tier, credits state). If
 Exceptions in the callback are caught and logged — they never break
 the response path.
 
+Tool calling: use :meth:`ChatCodexPlus.bind_tools` exactly like
+``ChatOpenAI.bind_tools``. Tools are serialized into the Codex
+Responses API ``tools`` field. Returned :class:`AIMessage` carries
+``tool_calls`` populated from the streamed ``function_call`` items.
+Tool results go back as :class:`langchain_core.messages.ToolMessage`
+with ``tool_call_id`` matching the original ``call_id`` — the
+protocol layer transparently serializes them as ``function_call_output``
+input entries.
+
 Not yet supported (planned follow-ups):
 
-* **Tool calling** — Codex Responses API supports tools, but mapping
-  LangChain ``BindToolsT`` is deferred.
 * **Image / multimodal input** — text only for v0.1.
 * **Stop sequences** — Codex Responses API doesn't expose them; the
   ``stop`` argument is currently ignored.
@@ -36,6 +43,7 @@ Not yet supported (planned follow-ups):
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from pathlib import Path
@@ -46,9 +54,13 @@ from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
 )
-from langchain_core.language_models import BaseChatModel
+from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.messages.tool import ToolCall, ToolCallChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.runnables import Runnable
+from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_openai_function
 from pydantic import ConfigDict, Field, PrivateAttr
 
 from langchain_codex_plus.codex_auth import (
@@ -61,6 +73,7 @@ from langchain_codex_plus.codex_protocol import (
     CodexCompletion,
     CodexResponseError,
     SseEvent,
+    ToolChoice,
     build_request_body,
     consume_events,
     parse_error_body,
@@ -178,6 +191,25 @@ class ChatCodexPlus(BaseChatModel):
             "Default False (don't bloat history)."
         ),
     )
+    tools: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Tools to send in the request body, in Codex Responses "
+            "API shape: ``[{'type': 'function', 'name', 'description', "
+            "'parameters': <JSON schema>}]``. Prefer :meth:`bind_tools` "
+            "over setting this directly — it handles LangChain "
+            "``BaseTool`` conversion."
+        ),
+    )
+    tool_choice: ToolChoice | None = Field(
+        default=None,
+        description=(
+            "Optional tool-choice directive. ``'auto'`` (model decides), "
+            "``'none'``, ``'required'``, or "
+            "``{'type': 'function', 'name': '...'}`` to force a specific "
+            "tool. Only included in the request body when non-None."
+        ),
+    )
 
     # ─── Private state ──────────────────────────────────────────────────
 
@@ -197,6 +229,67 @@ class ChatCodexPlus(BaseChatModel):
             "reasoning_effort": self.reasoning_effort,
             "api_base": self.api_base,
         }
+
+    # ─── Tool binding ───────────────────────────────────────────────────
+
+    def bind_tools(
+        self,
+        tools: Sequence[
+            dict[str, Any] | type | Callable[..., Any] | BaseTool
+        ],
+        *,
+        tool_choice: ToolChoice | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, BaseMessage]:
+        """Return a copy of this chat model with ``tools`` attached.
+
+        Accepts the same input shapes as ``ChatOpenAI.bind_tools``:
+
+        * LangChain ``BaseTool`` instances
+        * Pydantic models (used as the args schema)
+        * Plain Python callables (signature inferred via inspect)
+        * Pre-formed OpenAI-function dicts ``{"name", "description",
+          "parameters"}`` — passed through unchanged
+
+        Each tool is normalized to the Codex Responses API shape
+        ``{"type": "function", "name": "...", "description": "...",
+        "parameters": <JSON schema>}`` (note: name/description/parameters
+        are flattened to the top level — different from the Chat
+        Completions API's ``{"type": "function", "function": {...}}``
+        nesting).
+
+        ``tool_choice`` directives match the protocol module's
+        :class:`ToolChoice` type.
+        """
+        codex_tools: list[dict[str, Any]] = []
+        for t in tools:
+            if (
+                isinstance(t, dict)
+                and t.get("type") == "function"
+                and "name" in t
+            ):
+                # Already Codex shape (flat); pass through.
+                codex_tools.append(t)
+                continue
+            # convert_to_openai_function returns the inner
+            # ``{name, description, parameters}`` dict — exactly the
+            # shape Codex expects at the top level under ``type:
+            # function``.
+            fn_dict = convert_to_openai_function(t)
+            if (
+                isinstance(fn_dict, dict)
+                and fn_dict.get("type") == "function"
+                and "function" in fn_dict
+            ):
+                # Some versions of langchain-core return the nested
+                # Chat-Completions shape; unwrap it.
+                fn_dict = fn_dict["function"]
+            codex_tools.append({"type": "function", **fn_dict})
+        return self.bind(
+            tools=codex_tools,
+            tool_choice=tool_choice if tool_choice is not None else self.tool_choice,
+            **kwargs,
+        )
 
     # ─── Auth ───────────────────────────────────────────────────────────
 
@@ -237,13 +330,30 @@ class ChatCodexPlus(BaseChatModel):
             headers.update(self.extra_headers)
         return headers
 
-    def _build_body(self, messages: Sequence[BaseMessage]) -> dict[str, Any]:
+    def _build_body(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        tools_override: list[dict[str, Any]] | None = None,
+        tool_choice_override: ToolChoice | None = None,
+    ) -> dict[str, Any]:
+        """Build the request body. Per-call overrides (from
+        :meth:`bind_tools`) take precedence over the instance fields.
+        Pass ``None`` explicitly to mean "use the instance default";
+        the call sites pass through ``kwargs.get("tools")`` so a
+        bound runnable wins."""
         return build_request_body(
             messages,
             model=self.model,
             reasoning_effort=self.reasoning_effort,
             instructions_override=self.instructions,
             store=self.store,
+            tools=tools_override if tools_override is not None else self.tools,
+            tool_choice=(
+                tool_choice_override
+                if tool_choice_override is not None
+                else self.tool_choice
+            ),
             extra=self.extra_request_fields,
         )
 
@@ -284,11 +394,42 @@ class ChatCodexPlus(BaseChatModel):
                 if k in {"input_tokens", "output_tokens", "total_tokens"}
                 and isinstance(v, (int, float))
             } or None
+        # Convert collected Codex tool calls to LangChain ToolCall
+        # shape. ``args`` is parsed from the JSON string; if parsing
+        # fails (malformed model output), surface raw text in
+        # ``invalid_tool_calls`` so the caller can see what happened
+        # rather than silently dropping the call.
+        tool_calls: list[ToolCall] = []
+        invalid_tool_calls: list[dict[str, Any]] = []
+        for tc in completion.tool_calls:
+            try:
+                parsed_args = (
+                    json.loads(tc.arguments_json) if tc.arguments_json else {}
+                )
+            except json.JSONDecodeError as exc:
+                invalid_tool_calls.append({
+                    "id": tc.call_id,
+                    "name": tc.name,
+                    "args": tc.arguments_json,
+                    "error": str(exc),
+                    "type": "invalid_tool_call",
+                })
+                continue
+            if not isinstance(parsed_args, dict):
+                parsed_args = {"_value": parsed_args}
+            tool_calls.append(ToolCall(
+                name=tc.name,
+                args=parsed_args,
+                id=tc.call_id,
+                type="tool_call",
+            ))
         return AIMessage(
             content=completion.final_text,
             response_metadata=response_metadata,
             usage_metadata=usage_metadata,
             id=completion.response_id,
+            tool_calls=tool_calls,
+            invalid_tool_calls=invalid_tool_calls,
         )
 
     # ─── Sync sync path: _generate ──────────────────────────────────────
@@ -303,7 +444,11 @@ class ChatCodexPlus(BaseChatModel):
         if stop:
             logger.debug("Codex Responses API ignores stop sequences; %r dropped", stop)
         auth = self._resolve_auth()
-        body = self._build_body(messages)
+        body = self._build_body(
+            messages,
+            tools_override=kwargs.get("tools"),
+            tool_choice_override=kwargs.get("tool_choice"),
+        )
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = self._post_stream_sync(client, auth, body)
             try:
@@ -373,7 +518,11 @@ class ChatCodexPlus(BaseChatModel):
         if stop:
             logger.debug("Codex Responses API ignores stop sequences; %r dropped", stop)
         auth = self._resolve_auth()
-        body = self._build_body(messages)
+        body = self._build_body(
+            messages,
+            tools_override=kwargs.get("tools"),
+            tool_choice_override=kwargs.get("tool_choice"),
+        )
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = self._post_stream_sync(client, auth, body)
             try:
@@ -398,7 +547,11 @@ class ChatCodexPlus(BaseChatModel):
         if stop:
             logger.debug("Codex Responses API ignores stop sequences; %r dropped", stop)
         auth = self._resolve_auth()
-        body = self._build_body(messages)
+        body = self._build_body(
+            messages,
+            tools_override=kwargs.get("tools"),
+            tool_choice_override=kwargs.get("tool_choice"),
+        )
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await self._post_stream_async(client, auth, body)
             try:
@@ -469,7 +622,11 @@ class ChatCodexPlus(BaseChatModel):
         if stop:
             logger.debug("Codex Responses API ignores stop sequences; %r dropped", stop)
         auth = self._resolve_auth()
-        body = self._build_body(messages)
+        body = self._build_body(
+            messages,
+            tools_override=kwargs.get("tools"),
+            tool_choice_override=kwargs.get("tool_choice"),
+        )
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await self._post_stream_async(client, auth, body)
             try:
@@ -479,12 +636,14 @@ class ChatCodexPlus(BaseChatModel):
                 async for line in response.aiter_lines():
                     lines.append(line)
                 events = parse_sse_stream(lines)
-                # Stream chunks; we can't easily interleave SSE
-                # parsing with awaiting on_llm_new_token because
-                # parse_sse_stream is a sync generator, but we can
-                # still call the async callback for each chunk.
+                # Mirror of ``_yield_chunks_sync`` for the async path —
+                # kept inline so callers can ``await
+                # run_manager.on_llm_new_token`` on each text delta.
+                # Tool-call chunk emission identical to the sync path
+                # (see ``_yield_chunks_sync`` for the design rationale).
                 response_id: str | None = None
                 last_usage: dict[str, Any] | None = None
+                tool_call_index: dict[str, int] = {}
                 for ev in events:
                     if ev.event == "response.created":
                         resp = ev.data.get("response") or {}
@@ -498,6 +657,50 @@ class ChatCodexPlus(BaseChatModel):
                             yield ChatGenerationChunk(
                                 message=AIMessageChunk(
                                     content=delta, id=response_id
+                                )
+                            )
+                    elif ev.event == "response.output_item.added":
+                        item = ev.data.get("item") or {}
+                        if (
+                            isinstance(item, dict)
+                            and item.get("type") == "function_call"
+                        ):
+                            item_id = item.get("id")
+                            if isinstance(item_id, str):
+                                idx = len(tool_call_index)
+                                tool_call_index[item_id] = idx
+                                yield ChatGenerationChunk(
+                                    message=AIMessageChunk(
+                                        content="",
+                                        id=response_id,
+                                        tool_call_chunks=[ToolCallChunk(
+                                            name=item.get("name"),
+                                            args=item.get("arguments") or "",
+                                            id=item.get("call_id") or "",
+                                            index=idx,
+                                            type="tool_call_chunk",
+                                        )],
+                                    )
+                                )
+                    elif ev.event == "response.function_call_arguments.delta":
+                        item_id = ev.data.get("item_id")
+                        delta = ev.data.get("delta")
+                        if (
+                            isinstance(item_id, str)
+                            and item_id in tool_call_index
+                            and isinstance(delta, str)
+                        ):
+                            yield ChatGenerationChunk(
+                                message=AIMessageChunk(
+                                    content="",
+                                    id=response_id,
+                                    tool_call_chunks=[ToolCallChunk(
+                                        name=None,
+                                        args=delta,
+                                        id=None,
+                                        index=tool_call_index[item_id],
+                                        type="tool_call_chunk",
+                                    )],
                                 )
                             )
                     elif ev.event == "response.completed":
@@ -578,11 +781,22 @@ def _yield_chunks_sync(
 ) -> Iterator[ChatGenerationChunk]:
     """Sync version of the chunk-emitting loop used in ``_stream``.
 
-    Mirrors the inner body of ``_astream`` — kept separate so the
-    sync and async paths stay readable.
+    Maps Codex SSE events to LangChain chunks:
+
+    * ``response.output_text.delta`` → text content chunk
+    * ``response.output_item.added`` (function_call) → kickoff
+      ``ToolCallChunk`` carrying ``name`` + ``id``
+    * ``response.function_call_arguments.delta`` → ``ToolCallChunk``
+      with incremental ``args`` JSON fragment
+    * ``response.completed`` → usage-bearing terminal chunk
     """
     response_id: str | None = None
     last_usage: dict[str, Any] | None = None
+    # Map Codex item_id → (chunk_index, call_id, name) so we can
+    # stamp the same ``index`` on each delta chunk for a given tool
+    # call. LangChain merges chunks with matching index to assemble
+    # the final ToolCall on the message reducer side.
+    tool_call_index: dict[str, int] = {}
     for ev in events:
         if ev.event == "response.created":
             resp = ev.data.get("response") or {}
@@ -595,6 +809,47 @@ def _yield_chunks_sync(
                     run_manager.on_llm_new_token(delta)
                 yield ChatGenerationChunk(
                     message=AIMessageChunk(content=delta, id=response_id)
+                )
+        elif ev.event == "response.output_item.added":
+            item = ev.data.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                item_id = item.get("id")
+                if isinstance(item_id, str):
+                    idx = len(tool_call_index)
+                    tool_call_index[item_id] = idx
+                    yield ChatGenerationChunk(
+                        message=AIMessageChunk(
+                            content="",
+                            id=response_id,
+                            tool_call_chunks=[ToolCallChunk(
+                                name=item.get("name"),
+                                args=item.get("arguments") or "",
+                                id=item.get("call_id") or "",
+                                index=idx,
+                                type="tool_call_chunk",
+                            )],
+                        )
+                    )
+        elif ev.event == "response.function_call_arguments.delta":
+            item_id = ev.data.get("item_id")
+            delta = ev.data.get("delta")
+            if (
+                isinstance(item_id, str)
+                and item_id in tool_call_index
+                and isinstance(delta, str)
+            ):
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content="",
+                        id=response_id,
+                        tool_call_chunks=[ToolCallChunk(
+                            name=None,
+                            args=delta,
+                            id=None,
+                            index=tool_call_index[item_id],
+                            type="tool_call_chunk",
+                        )],
+                    )
                 )
         elif ev.event == "response.completed":
             resp = ev.data.get("response") or {}

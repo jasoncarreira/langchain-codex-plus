@@ -9,10 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterable
-from typing import Any
 
-import httpx
 import pytest
 from langchain_core.messages import (
     AIMessage,
@@ -27,31 +24,15 @@ from langchain_codex_plus import (
     CodexResponseError,
 )
 
-# ─── Test fixtures: SSE bodies + auth ───────────────────────────────────
-
-
-def _write_auth_json(path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "auth_mode": "chatgpt",
-        "tokens": {
-            "access_token": "atk-test",
-            "id_token": "jwt-test",
-            "refresh_token": "rtk-test",
-            "account_id": "test-account",
-        },
-        "last_refresh": "2026-05-21T01:02:18.121084Z",
-    }))
-
-
-def _sse_bytes(events: Iterable[tuple[str, dict[str, Any]]]) -> bytes:
-    """Build an SSE byte body from (event_name, data_dict) pairs."""
-    out = []
-    for name, data in events:
-        out.append(f"event: {name}")
-        out.append(f"data: {json.dumps(data)}")
-        out.append("")
-    return ("\n".join(out) + "\n").encode("utf-8")
+# Shared helpers (``_sse_bytes``, ``_make_llm``, ``_CaptureTransport``,
+# ``_AsyncCaptureTransport``, ``auth_file`` fixture) come from
+# ``tests/conftest.py``.
+from tests.conftest import (
+    _AsyncCaptureTransport,
+    _CaptureTransport,
+    _make_llm,
+    _sse_bytes,
+)
 
 
 def _ok_sse_body(text: str = "ok") -> bytes:
@@ -112,133 +93,6 @@ def _real_rl_headers() -> dict[str, str]:
         "x-codex-credits-has-credits": "False",
         "x-codex-credits-unlimited": "False",
     }
-
-
-class _CaptureTransport(httpx.BaseTransport):
-    """Mock httpx transport that returns a canned SSE body. Captures
-    the most recent outgoing request for assertions."""
-
-    def __init__(
-        self,
-        *,
-        status_code: int = 200,
-        body: bytes = b"",
-        headers: dict[str, str] | None = None,
-    ) -> None:
-        self.status_code = status_code
-        self.body = body
-        self.headers = headers or {}
-        self.last_request: httpx.Request | None = None
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        self.last_request = request
-        # Read the request body eagerly so tests can introspect it.
-        _ = request.read()
-        return httpx.Response(
-            status_code=self.status_code,
-            headers=self.headers,
-            content=self.body,
-            request=request,
-        )
-
-
-class _AsyncCaptureTransport(httpx.AsyncBaseTransport):
-    """Async sibling of ``_CaptureTransport``."""
-
-    def __init__(
-        self,
-        *,
-        status_code: int = 200,
-        body: bytes = b"",
-        headers: dict[str, str] | None = None,
-    ) -> None:
-        self.status_code = status_code
-        self.body = body
-        self.headers = headers or {}
-        self.last_request: httpx.Request | None = None
-
-    async def handle_async_request(
-        self, request: httpx.Request
-    ) -> httpx.Response:
-        self.last_request = request
-        _ = await request.aread()
-        return httpx.Response(
-            status_code=self.status_code,
-            headers=self.headers,
-            content=self.body,
-            request=request,
-        )
-
-
-@pytest.fixture
-def auth_file(tmp_path):
-    p = tmp_path / "auth.json"
-    _write_auth_json(p)
-    return p
-
-
-def _make_llm(
-    auth_file_path,
-    *,
-    transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None = None,
-    **kwargs: Any,
-) -> ChatCodexPlus:
-    llm = ChatCodexPlus(auth_file_path=auth_file_path, **kwargs)
-    if transport is not None:
-        # Monkey-patch the httpx client construction by overriding
-        # the underlying helper methods. We replace them with versions
-        # that build clients with the given mount.
-        def _build_sync(self, client, auth, body):
-            req = client.build_request(
-                "POST",
-                self._request_url(),
-                headers=self._request_headers(auth),
-                json=body,
-            )
-            return client.send(req, stream=True)
-
-        async def _build_async(self, client, auth, body):
-            req = client.build_request(
-                "POST",
-                self._request_url(),
-                headers=self._request_headers(auth),
-                json=body,
-            )
-            return await client.send(req, stream=True)
-
-        # Patch httpx.Client / AsyncClient via the test's mount kwarg.
-        # Simpler: monkey-patch the model's post helpers to use the
-        # transport directly. That keeps the chat model itself
-        # unchanged while letting tests inject canned responses.
-        import types
-
-        if isinstance(transport, httpx.BaseTransport):
-            def _post_sync(self, client, auth, body, _t=transport):
-                # Replace the client with one bound to our transport.
-                c2 = httpx.Client(transport=_t, timeout=self.timeout_seconds)
-                req = c2.build_request(
-                    "POST",
-                    self._request_url(),
-                    headers=self._request_headers(auth),
-                    json=body,
-                )
-                # Note: we leak this client; for tests that's fine.
-                return c2.send(req, stream=True)
-
-            llm._post_stream_sync = types.MethodType(_post_sync, llm)  # type: ignore[method-assign]
-        if isinstance(transport, httpx.AsyncBaseTransport):
-            async def _post_async(self, client, auth, body, _t=transport):
-                c2 = httpx.AsyncClient(transport=_t, timeout=self.timeout_seconds)
-                req = c2.build_request(
-                    "POST",
-                    self._request_url(),
-                    headers=self._request_headers(auth),
-                    json=body,
-                )
-                return await c2.send(req, stream=True)
-
-            llm._post_stream_async = types.MethodType(_post_async, llm)  # type: ignore[method-assign]
-    return llm
 
 
 # ─── Construction & auth ────────────────────────────────────────────────

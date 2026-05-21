@@ -95,20 +95,24 @@ def test_build_body_assistant_message_uses_output_text():
     }
 
 
-def test_build_body_tool_message_passes_through_as_user_for_now():
-    """ToolMessage surfacing is deferred (phase 3); for v0.1 we map
-    it to a user message so the model still sees the content."""
+def test_build_body_tool_message_becomes_function_call_output():
+    """``ToolMessage`` → Codex ``function_call_output`` entry with
+    ``call_id`` echoing the original ``tool_call_id``."""
     body = build_request_body(
         [
             HumanMessage("call X"),
-            ToolMessage(content="result-from-X", tool_call_id="t1"),
+            ToolMessage(content="result-from-X", tool_call_id="call_t1"),
             HumanMessage("now what"),
         ],
         model="gpt-5.4",
     )
-    # tool message appears in input as a user entry (not silently dropped)
-    user_entries = [e for e in body["input"] if e["role"] == "user"]
-    assert any("result-from-X" in e["content"][0]["text"] for e in user_entries)
+    fco = [e for e in body["input"] if e.get("type") == "function_call_output"]
+    assert len(fco) == 1
+    assert fco[0] == {
+        "type": "function_call_output",
+        "call_id": "call_t1",
+        "output": "result-from-X",
+    }
 
 
 def test_build_body_reasoning_effort_passthrough():

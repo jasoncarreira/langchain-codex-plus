@@ -20,7 +20,9 @@ from langchain_codex_plus.codex_chat_model import ChatCodexPlus
 from langchain_codex_plus.codex_protocol import (
     CodexCompletion,
     CodexResponseError,
+    CodexToolCall,
     SseEvent,
+    ToolChoice,
     build_request_body,
     consume_events,
     parse_error_body,
@@ -48,7 +50,9 @@ __all__ = [
     # codex_protocol
     "CodexCompletion",
     "CodexResponseError",
+    "CodexToolCall",
     "SseEvent",
+    "ToolChoice",
     "build_request_body",
     "consume_events",
     "parse_error_body",

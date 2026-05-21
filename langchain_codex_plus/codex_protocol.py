@@ -47,45 +47,101 @@ chat model passes whatever the caller sets and lets the gateway
 validate (caller gets a clear 400 if it's wrong)."""
 
 
-def _message_to_input_entry(message: Any) -> dict[str, Any] | None:
-    """Convert one LangChain ``BaseMessage`` to a Codex input entry.
+def _message_to_input_entries(message: Any) -> list[dict[str, Any]]:
+    """Convert one LangChain ``BaseMessage`` to Codex input entries.
 
-    Returns ``None`` for messages that go elsewhere (SystemMessage is
-    folded into ``instructions``, not the input list).
-
-    Codex's input shape per role:
-
-    * ``user`` content uses ``type: "input_text"``
-    * ``assistant`` content uses ``type: "output_text"``
+    Returns a list (possibly empty) — one message can expand to
+    multiple entries when an AIMessage has both text content and
+    tool calls (Codex represents each ``tool_call`` as its own
+    top-level ``function_call`` entry, not nested under the assistant
+    message). SystemMessage returns an empty list — it's folded into
+    ``instructions`` separately.
     """
     role = getattr(message, "type", None)
-    # LangChain conventions: ``human`` / ``ai`` / ``system`` / ``tool`` —
-    # need to map to Codex's ``user`` / ``assistant`` / (skip) / (tool).
     if role == "system":
-        return None
-    content = _coerce_message_content_to_text(message)
+        return []
     if role == "human":
-        return {
-            "role": "user",
-            "content": [{"type": "input_text", "text": content}],
-        }
+        return [
+            {
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": _coerce_message_content_to_text(message),
+                }],
+            }
+        ]
     if role == "ai":
-        return {
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": content}],
-        }
+        return _ai_message_to_entries(message)
     if role == "tool":
-        # TODO(phase 3): wire tool result message shape.
-        # For now, surface as a user message so the model sees the
-        # content rather than silently dropping it.
-        return {
-            "role": "user",
-            "content": [{"type": "input_text", "text": content}],
-        }
+        return [_tool_message_to_function_call_output(message)]
     # Unknown message type — pass as user. Better visible than silent.
+    return [
+        {
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": _coerce_message_content_to_text(message),
+            }],
+        }
+    ]
+
+
+def _ai_message_to_entries(message: Any) -> list[dict[str, Any]]:
+    """Map an ``AIMessage`` (possibly carrying tool_calls) to Codex
+    input entries.
+
+    Codex's Responses API represents an assistant turn that produced
+    tool calls as **multiple** top-level input entries:
+
+    1. (Optional) a ``role: assistant`` message with the text content,
+       only emitted when there's non-empty text — Codex rejects empty
+       output_text blocks.
+    2. One ``type: function_call`` entry per tool_call, with
+       ``call_id``, ``name``, and JSON-stringified ``arguments``.
+
+    LangChain's ``AIMessage.tool_calls`` is a list of
+    :class:`langchain_core.messages.tool.ToolCall` dicts with
+    ``{"name", "args" (dict), "id"}``. We serialize ``args`` to
+    JSON for the wire.
+    """
+    entries: list[dict[str, Any]] = []
+    text = _coerce_message_content_to_text(message)
+    if text:
+        entries.append({
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        })
+    for tc in getattr(message, "tool_calls", None) or []:
+        # ToolCall is a TypedDict in newer langchain-core; both
+        # attribute and item access work via dict lookup on TypedDict
+        # so accept either shape defensively.
+        name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+        args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+        call_id = (
+            tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+        )
+        if not name or not call_id:
+            continue  # malformed tool call — skip rather than emit garbage
+        entries.append({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": json.dumps(args or {}),
+        })
+    return entries
+
+
+def _tool_message_to_function_call_output(message: Any) -> dict[str, Any]:
+    """``ToolMessage`` → Codex ``function_call_output`` entry.
+
+    LangChain's ``ToolMessage`` has ``content`` (typically string)
+    and ``tool_call_id`` referencing the original tool_call. Codex
+    wants ``call_id`` matching the function_call's ``call_id``.
+    """
     return {
-        "role": "user",
-        "content": [{"type": "input_text", "text": content}],
+        "type": "function_call_output",
+        "call_id": getattr(message, "tool_call_id", None) or "",
+        "output": _coerce_message_content_to_text(message),
     }
 
 
@@ -128,6 +184,12 @@ def _extract_instructions(messages: Iterable[Any]) -> str:
     return "\n\n".join(parts)
 
 
+ToolChoice = (
+    str  # "auto" | "none" | "required"
+    | dict[str, Any]  # {"type": "function", "name": "..."}
+)
+
+
 def build_request_body(
     messages: Iterable[Any],
     *,
@@ -135,6 +197,8 @@ def build_request_body(
     reasoning_effort: str = "none",
     instructions_override: str | None = None,
     store: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: ToolChoice | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the JSON body for ``POST /codex/responses``.
@@ -142,6 +206,19 @@ def build_request_body(
     Always sets ``stream: true`` (Codex requires it). ``instructions``
     comes from ``instructions_override`` if provided, else from
     SystemMessages in ``messages``.
+
+    ``tools`` shape (Responses API):
+        ``[{"type": "function", "name": "...", "description": "...",
+            "parameters": <JSON schema dict>}]``
+
+    ``tool_choice`` accepts:
+        * ``"auto"`` — model decides whether to call (default behavior)
+        * ``"none"`` — disable tool calls for this turn
+        * ``"required"`` — force a tool call
+        * ``{"type": "function", "name": "..."}`` — force a specific one
+
+    Only included in the body when non-None / non-empty, so callers
+    without tools don't pay for the extra fields.
 
     ``extra`` is merged last — escape hatch for caller-supplied fields
     the protocol may add over time (``service_tier``, ``temperature``,
@@ -153,11 +230,9 @@ def build_request_body(
         if instructions_override is not None
         else _extract_instructions(messages_list)
     )
-    input_entries = [
-        e
-        for e in (_message_to_input_entry(m) for m in messages_list)
-        if e is not None
-    ]
+    input_entries: list[dict[str, Any]] = []
+    for m in messages_list:
+        input_entries.extend(_message_to_input_entries(m))
     body: dict[str, Any] = {
         "model": model,
         "instructions": instructions,
@@ -166,6 +241,10 @@ def build_request_body(
         "store": store,
         "reasoning": {"effort": reasoning_effort},
     }
+    if tools:
+        body["tools"] = list(tools)
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
     if extra:
         body.update(extra)
     return body
@@ -267,6 +346,33 @@ def iter_text_deltas(events: Iterable[SseEvent]) -> Iterator[str]:
 
 
 @dataclass(frozen=True)
+class CodexToolCall:
+    """One tool call collected from a Codex SSE stream.
+
+    Codex emits ``function_call`` items in two places:
+
+    * As ``response.output_item.added`` with ``item.type == "function_call"``
+      — carries ``id``, ``call_id``, ``name``, initial ``arguments``.
+    * As ``response.function_call_arguments.delta`` events keyed by
+      ``item_id`` — each carries an ``arguments`` JSON fragment to
+      append.
+
+    ``id`` is Codex's internal item id (``fc-...``). ``call_id`` is
+    the id we echo back in ``function_call_output`` to tie the
+    result to the call.
+    """
+
+    id: str
+    call_id: str
+    name: str
+    arguments_json: str
+    """Raw JSON string. We DON'T parse it here — callers that want
+    structured args should ``json.loads`` themselves. Some clients
+    pass non-strict JSON (trailing commas, etc.) through to model
+    feedback, and we don't want to crash mid-stream on the parse."""
+
+
+@dataclass(frozen=True)
 class CodexCompletion:
     """Terminal result extracted from a ``response.completed`` event."""
 
@@ -278,6 +384,10 @@ class CodexCompletion:
     """Concatenated output text across all message items. For multi-
     item responses (which Codex doesn't seem to do for text-only
     today, but could in future) all output_text blocks are joined."""
+
+    tool_calls: list[CodexToolCall]
+    """Tool calls collected during the stream. Empty list if the
+    model didn't call any tools."""
 
     usage: dict[str, Any] | None
     """Token usage as reported by Codex on the final event. Shape is
@@ -293,10 +403,9 @@ class CodexCompletion:
 def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
     """Drain the SSE event stream and return the final completion.
 
-    Tracks text deltas to build a final concatenated text in case the
-    ``response.completed`` payload doesn't include the assembled
-    output (defensive — empirically it does, but we don't want to
-    depend on that).
+    Tracks text deltas to build a final concatenated text and collects
+    tool calls from ``response.output_item.added`` (initial frame) +
+    ``response.function_call_arguments.delta`` (argument fragments).
 
     Raises :class:`CodexResponseError` if a ``response.error`` event
     arrives or if the stream ends without a ``response.completed``.
@@ -304,6 +413,10 @@ def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
     response_id: str | None = None
     text_parts: list[str] = []
     completed_response: dict[str, Any] | None = None
+    # In-progress tool calls, keyed by Codex's item_id (``fc-...``).
+    # Each entry tracks call_id + name (from output_item.added) and
+    # accumulates argument fragments (from arguments.delta events).
+    pending_tool_calls: dict[str, dict[str, Any]] = {}
 
     for evt in events:
         if evt.event == "response.created":
@@ -314,6 +427,26 @@ def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
             delta = evt.data.get("delta")
             if isinstance(delta, str):
                 text_parts.append(delta)
+        elif evt.event == "response.output_item.added":
+            item = evt.data.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                item_id = item.get("id")
+                if isinstance(item_id, str):
+                    pending_tool_calls[item_id] = {
+                        "id": item_id,
+                        "call_id": item.get("call_id") or "",
+                        "name": item.get("name") or "",
+                        "arguments": item.get("arguments") or "",
+                    }
+        elif evt.event == "response.function_call_arguments.delta":
+            item_id = evt.data.get("item_id")
+            delta = evt.data.get("delta")
+            if (
+                isinstance(item_id, str)
+                and isinstance(delta, str)
+                and item_id in pending_tool_calls
+            ):
+                pending_tool_calls[item_id]["arguments"] += delta
         elif evt.event == "response.completed":
             resp = evt.data.get("response", {})
             if isinstance(resp, dict):
@@ -341,14 +474,51 @@ def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
             raw={"partial_text": "".join(text_parts)},
         )
 
+    # Tool calls from the stream first; fall back to walking the
+    # ``output`` array on the completed event (defensive — covers
+    # responses where the gateway elided per-event signals).
+    tool_calls: list[CodexToolCall] = [
+        CodexToolCall(
+            id=tc["id"],
+            call_id=tc["call_id"],
+            name=tc["name"],
+            arguments_json=tc["arguments"],
+        )
+        for tc in pending_tool_calls.values()
+    ]
+    if not tool_calls:
+        tool_calls = _extract_tool_calls_from_output(completed_response)
+
     final_text = "".join(text_parts) or _extract_final_text(completed_response)
     usage = completed_response.get("usage")
     return CodexCompletion(
         response_id=response_id,
         final_text=final_text,
+        tool_calls=tool_calls,
         usage=usage if isinstance(usage, dict) else None,
         raw_response=completed_response,
     )
+
+
+def _extract_tool_calls_from_output(
+    response_obj: dict[str, Any],
+) -> list[CodexToolCall]:
+    """Fallback for when the SSE stream didn't carry per-event signals.
+    Walk the ``output`` array on the completed response and pull out
+    any ``function_call`` items."""
+    out: list[CodexToolCall] = []
+    for item in response_obj.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "function_call":
+            continue
+        out.append(CodexToolCall(
+            id=str(item.get("id") or ""),
+            call_id=str(item.get("call_id") or ""),
+            name=str(item.get("name") or ""),
+            arguments_json=str(item.get("arguments") or ""),
+        ))
+    return out
 
 
 def _extract_final_text(response_obj: dict[str, Any]) -> str:
