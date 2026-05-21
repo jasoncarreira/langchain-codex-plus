@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-codex-plus"
+version = "0.0.1"
+description = "LangChain ChatModel for OpenAI Codex Plus / Pro (ChatGPT-account subscription protocol, not api.openai.com)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Jason Carreira" }]
+keywords = ["langchain", "openai", "codex", "chatgpt", "subscription", "oauth"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "langchain-core>=0.3.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.6",
+  "mypy>=1.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/jasoncarreira/langchain-codex-plus"
+Issues   = "https://github.com/jasoncarreira/langchain-codex-plus/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_codex_plus"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+ignore = [
+  # En-dash characters in docstrings are intentional (typographic).
+  "RUF001",
+  "RUF002",
+  # __all__ is grouped by module of origin, not sorted — easier to
+  # cross-reference with imports.
+  "RUF022",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files can be long; readability beats line-length there.
+"tests/*" = ["E501"]

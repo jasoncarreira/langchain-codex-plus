@@ -1,0 +1,438 @@
+"""Codex ``/codex/responses`` protocol — request building + SSE parsing.
+
+Pure functions; no I/O. The chat model in ``codex_chat_model.py`` wraps
+these with httpx and pydantic.
+
+Verified empirically 2026-05-20 against a real Plus account:
+
+* ``POST /codex/responses?client_version=<v>`` requires:
+    - ``model`` (e.g., ``"gpt-5.4"``)
+    - ``instructions`` (string; SystemMessage content concat'd here)
+    - ``input`` (list of messages; ``{"role": ..., "content": [{"type":
+      "input_text" | "output_text", "text": ...}]}``)
+    - ``stream: true`` (non-streaming NOT supported)
+* Does NOT accept ``max_output_tokens``.
+* ``reasoning.effort`` for ``gpt-5.4`` must be one of:
+  ``none | low | medium | high | xhigh`` (NOT ``"minimal"``).
+
+SSE event types observed (text-only flow):
+
+* ``response.created`` — initial envelope, contains response.id
+* ``response.in_progress`` — server has started
+* ``response.output_item.added`` — a new message item begins
+* ``response.content_part.added`` — a content block within the message
+* ``response.output_text.delta`` — incremental text token (``data.delta``)
+* ``response.output_text.done`` — final text for the content part
+* ``response.content_part.done`` — closes the content block
+* ``response.output_item.done`` — closes the message item
+* ``response.completed`` — terminal event; ``data.response.usage`` has totals
+
+Errors mid-stream arrive as ``event: response.error`` or as a plain JSON
+body when the HTTP envelope is non-200; both shapes carry
+``{"error": {"message": ..., "type": ..., "code": ...}}``.
+"""
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from typing import Any
+
+# ─── Request building ──────────────────────────────────────────────────
+
+
+VALID_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh"})
+"""For ``gpt-5.4``. Other models may accept different values; the
+chat model passes whatever the caller sets and lets the gateway
+validate (caller gets a clear 400 if it's wrong)."""
+
+
+def _message_to_input_entry(message: Any) -> dict[str, Any] | None:
+    """Convert one LangChain ``BaseMessage`` to a Codex input entry.
+
+    Returns ``None`` for messages that go elsewhere (SystemMessage is
+    folded into ``instructions``, not the input list).
+
+    Codex's input shape per role:
+
+    * ``user`` content uses ``type: "input_text"``
+    * ``assistant`` content uses ``type: "output_text"``
+    """
+    role = getattr(message, "type", None)
+    # LangChain conventions: ``human`` / ``ai`` / ``system`` / ``tool`` —
+    # need to map to Codex's ``user`` / ``assistant`` / (skip) / (tool).
+    if role == "system":
+        return None
+    content = _coerce_message_content_to_text(message)
+    if role == "human":
+        return {
+            "role": "user",
+            "content": [{"type": "input_text", "text": content}],
+        }
+    if role == "ai":
+        return {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content}],
+        }
+    if role == "tool":
+        # TODO(phase 3): wire tool result message shape.
+        # For now, surface as a user message so the model sees the
+        # content rather than silently dropping it.
+        return {
+            "role": "user",
+            "content": [{"type": "input_text", "text": content}],
+        }
+    # Unknown message type — pass as user. Better visible than silent.
+    return {
+        "role": "user",
+        "content": [{"type": "input_text", "text": content}],
+    }
+
+
+def _coerce_message_content_to_text(message: Any) -> str:
+    """LangChain messages can have either ``str`` content or a list
+    of content-block dicts. Flatten to a single string for Codex
+    ``input_text`` / ``output_text``.
+
+    Multimodal (images, etc.) is dropped here — Codex Responses API
+    accepts ``input_image`` but mapping LangChain image blocks is
+    deferred to a follow-up since the wrapping conventions vary.
+    """
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text") or block.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return str(content) if content is not None else ""
+
+
+def _extract_instructions(messages: Iterable[Any]) -> str:
+    """Concatenate all SystemMessage contents into a single
+    ``instructions`` string. Codex's instructions field is a string,
+    not a list — multi-system-message inputs get joined with
+    double-newlines."""
+    parts: list[str] = []
+    for m in messages:
+        if getattr(m, "type", None) == "system":
+            text = _coerce_message_content_to_text(m)
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts)
+
+
+def build_request_body(
+    messages: Iterable[Any],
+    *,
+    model: str,
+    reasoning_effort: str = "none",
+    instructions_override: str | None = None,
+    store: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the JSON body for ``POST /codex/responses``.
+
+    Always sets ``stream: true`` (Codex requires it). ``instructions``
+    comes from ``instructions_override`` if provided, else from
+    SystemMessages in ``messages``.
+
+    ``extra`` is merged last — escape hatch for caller-supplied fields
+    the protocol may add over time (``service_tier``, ``temperature``,
+    etc.).
+    """
+    messages_list = list(messages)
+    instructions = (
+        instructions_override
+        if instructions_override is not None
+        else _extract_instructions(messages_list)
+    )
+    input_entries = [
+        e
+        for e in (_message_to_input_entry(m) for m in messages_list)
+        if e is not None
+    ]
+    body: dict[str, Any] = {
+        "model": model,
+        "instructions": instructions,
+        "input": input_entries,
+        "stream": True,
+        "store": store,
+        "reasoning": {"effort": reasoning_effort},
+    }
+    if extra:
+        body.update(extra)
+    return body
+
+
+# ─── SSE parsing ────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SseEvent:
+    """One parsed SSE event: an ``event:`` line + a ``data:`` line.
+
+    Codex sends one event-data pair separated by a blank line. We
+    expose both fields raw; downstream helpers extract specific
+    payloads.
+    """
+
+    event: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+def parse_sse_stream(lines: Iterable[str]) -> Iterator[SseEvent]:
+    """Parse Codex's SSE byte stream into :class:`SseEvent` objects.
+
+    Input: iterable of decoded lines (one per ``\\n`` boundary). The
+    chat model decodes the response stream and passes the lines here.
+
+    Robust to:
+
+    * Blank lines (event separators) — used as boundary markers.
+    * Multi-line ``data:`` values — accumulated until the blank line.
+    * Missing ``event:`` — yields an event with empty ``event`` string
+      so callers can detect malformed input.
+    * Garbage ``data:`` JSON — yielded with ``data={}`` and the raw
+      text dropped (we err on the side of "keep streaming" over
+      "crash mid-response").
+    """
+    current_event: str = ""
+    data_buffer: list[str] = []
+
+    def flush() -> SseEvent | None:
+        nonlocal current_event, data_buffer
+        if not current_event and not data_buffer:
+            return None
+        raw_data = "\n".join(data_buffer)
+        parsed: dict[str, Any]
+        if not raw_data:
+            parsed = {}
+        else:
+            try:
+                parsed = json.loads(raw_data)
+                if not isinstance(parsed, dict):
+                    parsed = {"_raw": parsed}
+            except json.JSONDecodeError:
+                parsed = {}
+        evt = SseEvent(event=current_event, data=parsed)
+        current_event = ""
+        data_buffer = []
+        return evt
+
+    for line in lines:
+        # SSE lines are LF-separated; if iterable yields with trailing
+        # ``\r\n`` strip it.
+        line = line.rstrip("\r\n")
+        if not line:
+            # Empty line = event boundary.
+            evt = flush()
+            if evt is not None:
+                yield evt
+            continue
+        if line.startswith(":"):
+            # SSE comment line — heartbeat / keepalive. Ignore.
+            continue
+        if line.startswith("event:"):
+            current_event = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_buffer.append(line[len("data:"):].lstrip())
+        # Ignore unknown SSE fields (``id:``, ``retry:``) — Codex
+        # doesn't use them today.
+
+    # Trailing event without a final blank line (rare; defensive).
+    final = flush()
+    if final is not None:
+        yield final
+
+
+def iter_text_deltas(events: Iterable[SseEvent]) -> Iterator[str]:
+    """Yield incremental text fragments from a Codex SSE event stream.
+
+    Only emits ``response.output_text.delta`` events' ``delta`` field.
+    Skips bookkeeping events (item.added, content_part.added, done,
+    completed).
+    """
+    for evt in events:
+        if evt.event == "response.output_text.delta":
+            delta = evt.data.get("delta")
+            if isinstance(delta, str) and delta:
+                yield delta
+
+
+@dataclass(frozen=True)
+class CodexCompletion:
+    """Terminal result extracted from a ``response.completed`` event."""
+
+    response_id: str | None
+    """Codex assigns each response an ID (``resp_...``). Useful for
+    chaining with ``previous_response_id`` on a follow-up call."""
+
+    final_text: str
+    """Concatenated output text across all message items. For multi-
+    item responses (which Codex doesn't seem to do for text-only
+    today, but could in future) all output_text blocks are joined."""
+
+    usage: dict[str, Any] | None
+    """Token usage as reported by Codex on the final event. Shape is
+    OpenAI Responses API style (``input_tokens``, ``output_tokens``,
+    ``total_tokens``, ...). May be ``None`` if the gateway omits it."""
+
+    raw_response: dict[str, Any]
+    """The full ``data.response`` object from the ``response.completed``
+    event. Exposed so callers can introspect fields we haven't
+    promoted to typed accessors (``service_tier``, ``model``, etc.)."""
+
+
+def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
+    """Drain the SSE event stream and return the final completion.
+
+    Tracks text deltas to build a final concatenated text in case the
+    ``response.completed`` payload doesn't include the assembled
+    output (defensive — empirically it does, but we don't want to
+    depend on that).
+
+    Raises :class:`CodexResponseError` if a ``response.error`` event
+    arrives or if the stream ends without a ``response.completed``.
+    """
+    response_id: str | None = None
+    text_parts: list[str] = []
+    completed_response: dict[str, Any] | None = None
+
+    for evt in events:
+        if evt.event == "response.created":
+            resp = evt.data.get("response", {})
+            if isinstance(resp, dict):
+                response_id = resp.get("id") or response_id
+        elif evt.event == "response.output_text.delta":
+            delta = evt.data.get("delta")
+            if isinstance(delta, str):
+                text_parts.append(delta)
+        elif evt.event == "response.completed":
+            resp = evt.data.get("response", {})
+            if isinstance(resp, dict):
+                completed_response = resp
+                response_id = resp.get("id") or response_id
+        elif evt.event == "response.error" or evt.event == "error":
+            err = evt.data.get("error") or evt.data
+            raise CodexResponseError(
+                message=(
+                    err.get("message") if isinstance(err, dict) else str(err)
+                )
+                or "Codex returned an error mid-stream",
+                code=err.get("code") if isinstance(err, dict) else None,
+                type=err.get("type") if isinstance(err, dict) else None,
+                raw=evt.data,
+            )
+
+    if completed_response is None:
+        raise CodexResponseError(
+            message=(
+                "Codex SSE stream ended without a response.completed event"
+            ),
+            code=None,
+            type="stream_terminated_early",
+            raw={"partial_text": "".join(text_parts)},
+        )
+
+    final_text = "".join(text_parts) or _extract_final_text(completed_response)
+    usage = completed_response.get("usage")
+    return CodexCompletion(
+        response_id=response_id,
+        final_text=final_text,
+        usage=usage if isinstance(usage, dict) else None,
+        raw_response=completed_response,
+    )
+
+
+def _extract_final_text(response_obj: dict[str, Any]) -> str:
+    """Fallback for when we didn't collect deltas. Walk the
+    ``output`` array and concatenate all ``output_text`` block texts.
+    """
+    parts: list[str] = []
+    for item in response_obj.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for block in item.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                t = block.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+    return "".join(parts)
+
+
+# ─── Errors ─────────────────────────────────────────────────────────────
+
+
+class CodexResponseError(RuntimeError):
+    """Codex returned an error — either as an HTTP non-2xx envelope
+    or as a ``response.error`` SSE event mid-stream."""
+
+    def __init__(
+        self,
+        *,
+        message: str,
+        code: str | None = None,
+        type: str | None = None,
+        raw: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.type = type
+        self.raw = raw
+
+    def __repr__(self) -> str:
+        bits = [f"message={self.message!r}"]
+        if self.code:
+            bits.append(f"code={self.code!r}")
+        if self.type:
+            bits.append(f"type={self.type!r}")
+        return f"CodexResponseError({', '.join(bits)})"
+
+
+def parse_error_body(body_bytes: bytes) -> CodexResponseError:
+    """Parse the JSON body returned with a non-2xx HTTP envelope.
+
+    Codex's two error shapes:
+
+    1. ``{"detail": "Some message"}`` — short validator errors.
+    2. ``{"error": {"message": ..., "type": ..., "code": ...}}`` —
+       OpenAI-style structured errors.
+
+    Returns a :class:`CodexResponseError` either way.
+    """
+    try:
+        parsed = json.loads(body_bytes.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return CodexResponseError(
+            message=body_bytes.decode("utf-8", errors="replace")[:500]
+            or "<empty response body>",
+            raw=body_bytes,
+        )
+    if not isinstance(parsed, dict):
+        return CodexResponseError(message=str(parsed)[:500], raw=parsed)
+    if "error" in parsed and isinstance(parsed["error"], dict):
+        err = parsed["error"]
+        return CodexResponseError(
+            message=str(err.get("message") or "Codex error"),
+            code=err.get("code"),
+            type=err.get("type"),
+            raw=parsed,
+        )
+    if "detail" in parsed:
+        return CodexResponseError(
+            message=str(parsed["detail"]),
+            type="validation_error",
+            raw=parsed,
+        )
+    return CodexResponseError(
+        message=json.dumps(parsed)[:500],
+        raw=parsed,
+    )
