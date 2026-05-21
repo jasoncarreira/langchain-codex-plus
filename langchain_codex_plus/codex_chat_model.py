@@ -44,10 +44,20 @@ image blocks; the protocol layer maps them to Codex's ``input_text``
 * ``{"type": "image", "source_type": "base64", "data": ...,
   "mime_type": "image/png"}`` (encoded as a ``data:`` URL)
 
+Stop sequences: Codex's ``/codex/responses`` rejects the ``stop``
+parameter (400 ``Unsupported parameter: stop``), so this package
+implements them client-side. The streaming paths use a buffered
+matcher that holds back ``max(len(s) for s in stop) - 1`` trailing
+characters until they can be ruled out, so a stop seq split across
+chunks (the common tokenization case) still truncates cleanly. On
+match, the message is truncated, the SSE connection is closed early,
+and ``response_metadata['finish_reason']`` is ``'stopped_at_client'``.
+Note: Codex may keep generating tokens server-side until we close —
+on a subscription account this is a window-utilization cost only,
+not a per-token billing cost.
+
 Not yet supported (planned follow-ups):
 
-* **Stop sequences** — Codex Responses API doesn't expose them; the
-  ``stop`` argument is currently ignored.
 * **Token refresh** — relies on the user re-authing via Codex CLI.
 """
 from __future__ import annotations
@@ -85,6 +95,7 @@ from langchain_codex_plus.codex_protocol import (
     ToolChoice,
     build_request_body,
     consume_events,
+    first_stop_match,
     parse_error_body,
     parse_sse_stream,
 )
@@ -451,7 +462,11 @@ class ChatCodexPlus(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         if stop:
-            logger.debug("Codex Responses API ignores stop sequences; %r dropped", stop)
+            logger.debug(
+                "Codex /codex/responses doesn't accept ``stop``; matching "
+                "client-side on %r. Codex may keep generating tokens until "
+                "we close the SSE connection.", stop
+            )
         auth = self._resolve_auth()
         body = self._build_body(
             messages,
@@ -463,7 +478,7 @@ class ChatCodexPlus(BaseChatModel):
             try:
                 self._raise_for_http_error(response)
                 self._fire_rate_limit_callback(response.headers)
-                completion = self._consume_sync(response, run_manager)
+                completion = self._consume_sync(response, run_manager, stop=stop)
             finally:
                 response.close()
         message = self._completion_to_ai_message(completion)
@@ -506,14 +521,19 @@ class ChatCodexPlus(BaseChatModel):
         self,
         response: httpx.Response,
         run_manager: CallbackManagerForLLMRun | None,
+        *,
+        stop: list[str] | None = None,
     ) -> CodexCompletion:
         events_iter = parse_sse_stream(response.iter_lines())
         # Tap text deltas for run_manager.on_llm_new_token so LangChain
         # callback handlers (LangSmith, custom loggers) see streaming
         # tokens even in the non-streaming _generate path.
         if run_manager is None:
-            return consume_events(events_iter)
-        return consume_events(_tap_text_deltas_sync(events_iter, run_manager))
+            return consume_events(events_iter, stop_sequences=stop)
+        return consume_events(
+            _tap_text_deltas_sync(events_iter, run_manager),
+            stop_sequences=stop,
+        )
 
     # ─── Sync streaming: _stream ────────────────────────────────────────
 
@@ -525,7 +545,10 @@ class ChatCodexPlus(BaseChatModel):
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
         if stop:
-            logger.debug("Codex Responses API ignores stop sequences; %r dropped", stop)
+            logger.debug(
+                "Codex /codex/responses doesn't accept ``stop``; matching "
+                "client-side on %r.", stop
+            )
         auth = self._resolve_auth()
         body = self._build_body(
             messages,
@@ -540,6 +563,7 @@ class ChatCodexPlus(BaseChatModel):
                 yield from _yield_chunks_sync(
                     parse_sse_stream(response.iter_lines()),
                     run_manager=run_manager,
+                    stop=stop,
                 )
             finally:
                 response.close()
@@ -554,7 +578,10 @@ class ChatCodexPlus(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         if stop:
-            logger.debug("Codex Responses API ignores stop sequences; %r dropped", stop)
+            logger.debug(
+                "Codex /codex/responses doesn't accept ``stop``; matching "
+                "client-side on %r.", stop
+            )
         auth = self._resolve_auth()
         body = self._build_body(
             messages,
@@ -566,7 +593,9 @@ class ChatCodexPlus(BaseChatModel):
             try:
                 await self._araise_for_http_error(response)
                 self._fire_rate_limit_callback(response.headers)
-                completion = await self._consume_async(response, run_manager)
+                completion = await self._consume_async(
+                    response, run_manager, stop=stop
+                )
             finally:
                 await response.aclose()
         message = self._completion_to_ai_message(completion)
@@ -602,6 +631,8 @@ class ChatCodexPlus(BaseChatModel):
         self,
         response: httpx.Response,
         run_manager: AsyncCallbackManagerForLLMRun | None,
+        *,
+        stop: list[str] | None = None,
     ) -> CodexCompletion:
         # parse_sse_stream is sync — buffer lines into a list as they
         # arrive, then feed through. For long streams a fully-async
@@ -612,12 +643,29 @@ class ChatCodexPlus(BaseChatModel):
             lines.append(line)
         events = list(parse_sse_stream(lines))
         if run_manager is not None:
+            # Walk events, firing on_llm_new_token for each delta —
+            # stopping at the first stop-sequence match if ``stop`` is
+            # set, so the callback consumer sees the same truncated
+            # token stream the caller will see.
+            text_so_far = ""
             for ev in events:
-                if ev.event == "response.output_text.delta":
-                    delta = ev.data.get("delta")
-                    if isinstance(delta, str) and delta:
-                        await run_manager.on_llm_new_token(delta)
-        return consume_events(events)
+                if ev.event != "response.output_text.delta":
+                    continue
+                delta = ev.data.get("delta")
+                if not isinstance(delta, str) or not delta:
+                    continue
+                if stop:
+                    new_text = text_so_far + delta
+                    match_idx = first_stop_match(new_text, stop)
+                    if match_idx is not None:
+                        emit_len = max(0, match_idx - len(text_so_far))
+                        emit = delta[:emit_len]
+                        if emit:
+                            await run_manager.on_llm_new_token(emit)
+                        break
+                    text_so_far = new_text
+                await run_manager.on_llm_new_token(delta)
+        return consume_events(events, stop_sequences=stop)
 
     # ─── Async streaming: _astream ──────────────────────────────────────
 
@@ -629,7 +677,10 @@ class ChatCodexPlus(BaseChatModel):
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
         if stop:
-            logger.debug("Codex Responses API ignores stop sequences; %r dropped", stop)
+            logger.debug(
+                "Codex /codex/responses doesn't accept ``stop``; matching "
+                "client-side on %r.", stop
+            )
         auth = self._resolve_auth()
         body = self._build_body(
             messages,
@@ -653,6 +704,17 @@ class ChatCodexPlus(BaseChatModel):
                 response_id: str | None = None
                 last_usage: dict[str, Any] | None = None
                 tool_call_index: dict[str, int] = {}
+                # Same buffered stop-matching algorithm as the sync
+                # streaming path (see ``_yield_chunks_sync`` for the
+                # full rationale: hold back the trailing chars that
+                # could be a stop prefix until we have enough text to
+                # rule it out).
+                text_so_far = ""
+                hold_buffer = ""
+                max_stop_len = (
+                    max((len(s) for s in stop), default=0) if stop else 0
+                )
+                stopped_early = False
                 for ev in events:
                     if ev.event == "response.created":
                         resp = ev.data.get("response") or {}
@@ -660,7 +722,9 @@ class ChatCodexPlus(BaseChatModel):
                             response_id = resp.get("id")
                     elif ev.event == "response.output_text.delta":
                         delta = ev.data.get("delta")
-                        if isinstance(delta, str) and delta:
+                        if not isinstance(delta, str) or not delta:
+                            continue
+                        if not stop:
                             if run_manager is not None:
                                 await run_manager.on_llm_new_token(delta)
                             yield ChatGenerationChunk(
@@ -668,6 +732,36 @@ class ChatCodexPlus(BaseChatModel):
                                     content=delta, id=response_id
                                 )
                             )
+                            continue
+                        combined = hold_buffer + delta
+                        all_text = text_so_far + combined
+                        match_idx = first_stop_match(all_text, stop)
+                        if match_idx is not None:
+                            to_emit = all_text[len(text_so_far):match_idx]
+                            if to_emit:
+                                if run_manager is not None:
+                                    await run_manager.on_llm_new_token(to_emit)
+                                yield ChatGenerationChunk(
+                                    message=AIMessageChunk(
+                                        content=to_emit, id=response_id
+                                    )
+                                )
+                            stopped_early = True
+                            break
+                        safe_emit_len = len(combined) - (max_stop_len - 1)
+                        if safe_emit_len > 0:
+                            to_emit = combined[:safe_emit_len]
+                            if run_manager is not None:
+                                await run_manager.on_llm_new_token(to_emit)
+                            yield ChatGenerationChunk(
+                                message=AIMessageChunk(
+                                    content=to_emit, id=response_id
+                                )
+                            )
+                            text_so_far += to_emit
+                            hold_buffer = combined[safe_emit_len:]
+                        else:
+                            hold_buffer = combined
                     elif ev.event == "response.output_item.added":
                         item = ev.data.get("item") or {}
                         if (
@@ -740,8 +834,22 @@ class ChatCodexPlus(BaseChatModel):
                             ),
                             raw=ev.data,
                         )
-                # Final chunk carries usage metadata.
-                if last_usage is not None:
+                # Natural completion: flush any held-back text (we'd
+                # buffered it in case it was a stop prefix; the stream
+                # ended without ever matching). Then emit the usage
+                # chunk. On client-side stop we ``break`` early, so
+                # ``stopped_early`` is True and no terminal chunk
+                # emits — the right signal to LangChain that this
+                # stream ended without natural completion.
+                if hold_buffer and not stopped_early:
+                    if run_manager is not None:
+                        await run_manager.on_llm_new_token(hold_buffer)
+                    yield ChatGenerationChunk(
+                        message=AIMessageChunk(
+                            content=hold_buffer, id=response_id
+                        )
+                    )
+                if last_usage is not None and not stopped_early:
                     usage_metadata = {
                         k: int(v)
                         for k, v in last_usage.items()
@@ -787,6 +895,7 @@ def _yield_chunks_sync(
     events: Iterator[SseEvent],
     *,
     run_manager: CallbackManagerForLLMRun | None,
+    stop: list[str] | None = None,
 ) -> Iterator[ChatGenerationChunk]:
     """Sync version of the chunk-emitting loop used in ``_stream``.
 
@@ -798,6 +907,11 @@ def _yield_chunks_sync(
     * ``response.function_call_arguments.delta`` → ``ToolCallChunk``
       with incremental ``args`` JSON fragment
     * ``response.completed`` → usage-bearing terminal chunk
+
+    If ``stop`` is provided, the running text is checked after each
+    delta; a match truncates the current delta to just-before the
+    stop sequence, yields that, and exits early. Codex may keep
+    generating server-side until we close the connection.
     """
     response_id: str | None = None
     last_usage: dict[str, Any] | None = None
@@ -806,6 +920,13 @@ def _yield_chunks_sync(
     # call. LangChain merges chunks with matching index to assemble
     # the final ToolCall on the message reducer side.
     tool_call_index: dict[str, int] = {}
+    # Buffered stop-sequence matcher: ``text_so_far`` is what we've
+    # already YIELDED to the caller; ``hold_buffer`` is text we've
+    # received but held back in case it's the prefix of a stop seq
+    # we'd otherwise have to un-emit (which streaming doesn't allow).
+    text_so_far = ""
+    hold_buffer = ""
+    max_stop_len = max((len(s) for s in stop), default=0) if stop else 0
     for ev in events:
         if ev.event == "response.created":
             resp = ev.data.get("response") or {}
@@ -813,12 +934,54 @@ def _yield_chunks_sync(
                 response_id = resp.get("id")
         elif ev.event == "response.output_text.delta":
             delta = ev.data.get("delta")
-            if isinstance(delta, str) and delta:
+            if not isinstance(delta, str) or not delta:
+                continue
+            if not stop:
+                # Fast path: no stop sequences set. Emit eagerly.
                 if run_manager is not None:
                     run_manager.on_llm_new_token(delta)
                 yield ChatGenerationChunk(
                     message=AIMessageChunk(content=delta, id=response_id)
                 )
+                continue
+            # Stop-aware path. Combine the held buffer with the new
+            # delta; check if a stop now appears in the *total* text.
+            combined = hold_buffer + delta
+            all_text = text_so_far + combined
+            match_idx = first_stop_match(all_text, stop)
+            if match_idx is not None:
+                # Emit any text up to the match that hasn't been
+                # yielded yet, then exit. The slice is relative to
+                # ``all_text``; we trim by ``text_so_far`` length.
+                to_emit = all_text[len(text_so_far):match_idx]
+                if to_emit:
+                    if run_manager is not None:
+                        run_manager.on_llm_new_token(to_emit)
+                    yield ChatGenerationChunk(
+                        message=AIMessageChunk(
+                            content=to_emit, id=response_id
+                        )
+                    )
+                return
+            # No match yet. Emit the prefix of ``combined`` that's
+            # *guaranteed* not to be the start of any stop seq —
+            # i.e., everything except the trailing (max_stop_len - 1)
+            # characters. Those stay in ``hold_buffer`` until the
+            # next delta arrives.
+            safe_emit_len = len(combined) - (max_stop_len - 1)
+            if safe_emit_len > 0:
+                to_emit = combined[:safe_emit_len]
+                if run_manager is not None:
+                    run_manager.on_llm_new_token(to_emit)
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content=to_emit, id=response_id
+                    )
+                )
+                text_so_far += to_emit
+                hold_buffer = combined[safe_emit_len:]
+            else:
+                hold_buffer = combined
         elif ev.event == "response.output_item.added":
             item = ev.data.get("item") or {}
             if isinstance(item, dict) and item.get("type") == "function_call":
@@ -880,6 +1043,17 @@ def _yield_chunks_sync(
                 type=err.get("type") if isinstance(err, dict) else None,
                 raw=ev.data,
             )
+    # Natural completion: flush any text held back for stop-matching
+    # before emitting the terminal usage chunk. If we reach here with
+    # ``hold_buffer`` non-empty, the stream completed without ever
+    # matching a stop sequence — those held characters are real output
+    # and must be delivered.
+    if hold_buffer:
+        if run_manager is not None:
+            run_manager.on_llm_new_token(hold_buffer)
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(content=hold_buffer, id=response_id)
+        )
     if last_usage is not None:
         usage_metadata = {
             k: int(v)

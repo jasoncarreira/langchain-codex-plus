@@ -532,7 +532,29 @@ class CodexCompletion:
     promoted to typed accessors (``service_tier``, ``model``, etc.)."""
 
 
-def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
+def first_stop_match(text: str, stops: list[str]) -> int | None:
+    """Return the lowest index in ``text`` where any of ``stops``
+    first appears, or ``None`` if none match.
+
+    Empty strings in ``stops`` are ignored — they'd otherwise match
+    at index 0 and break the caller's expectation that ``None`` ==
+    "no stop seen yet".
+    """
+    best: int | None = None
+    for s in stops:
+        if not s:
+            continue
+        idx = text.find(s)
+        if idx >= 0 and (best is None or idx < best):
+            best = idx
+    return best
+
+
+def consume_events(
+    events: Iterable[SseEvent],
+    *,
+    stop_sequences: list[str] | None = None,
+) -> CodexCompletion:
     """Drain the SSE event stream and return the final completion.
 
     Tracks text deltas to build a final concatenated text and collects
@@ -541,10 +563,20 @@ def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
 
     Raises :class:`CodexResponseError` if a ``response.error`` event
     arrives or if the stream ends without a ``response.completed``.
+
+    **Client-side stop sequences**: when ``stop_sequences`` is set, the
+    accumulated output text is checked after each delta. On match, the
+    text is truncated at the first match, event consumption stops
+    early, and a synthesized :class:`CodexCompletion` is returned with
+    ``response_metadata`` indicating an early stop. Note: Codex's
+    ``/codex/responses`` endpoint rejects the ``stop`` parameter, so
+    this is the *only* way to stop early — Codex may continue
+    generating tokens server-side until the SSE connection closes.
     """
     response_id: str | None = None
     text_parts: list[str] = []
     completed_response: dict[str, Any] | None = None
+    early_stop_text: str | None = None
     # In-progress tool calls, keyed by Codex's item_id (``fc-...``).
     # Each entry tracks call_id + name (from output_item.added) and
     # accumulates argument fragments (from arguments.delta events).
@@ -559,6 +591,12 @@ def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
             delta = evt.data.get("delta")
             if isinstance(delta, str):
                 text_parts.append(delta)
+                if stop_sequences:
+                    accumulated = "".join(text_parts)
+                    match_idx = first_stop_match(accumulated, stop_sequences)
+                    if match_idx is not None:
+                        early_stop_text = accumulated[:match_idx]
+                        break
         elif evt.event == "response.output_item.added":
             item = evt.data.get("item") or {}
             if isinstance(item, dict) and item.get("type") == "function_call":
@@ -596,6 +634,31 @@ def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
                 raw=evt.data,
             )
 
+    # Early-stop path: client-side stop sequence matched. Return a
+    # synthesized completion. ``raw_response`` carries an explicit
+    # ``stopped_at_client`` marker so callers can distinguish it from a
+    # natural completion.
+    if early_stop_text is not None:
+        tool_calls = [
+            CodexToolCall(
+                id=tc["id"],
+                call_id=tc["call_id"],
+                name=tc["name"],
+                arguments_json=tc["arguments"],
+            )
+            for tc in pending_tool_calls.values()
+        ]
+        return CodexCompletion(
+            response_id=response_id,
+            final_text=early_stop_text,
+            tool_calls=tool_calls,
+            usage=None,
+            raw_response={
+                "status": "stopped_at_client",
+                "stopped_at_client": True,
+            },
+        )
+
     if completed_response is None:
         raise CodexResponseError(
             message=(
@@ -609,7 +672,7 @@ def consume_events(events: Iterable[SseEvent]) -> CodexCompletion:
     # Tool calls from the stream first; fall back to walking the
     # ``output`` array on the completed event (defensive — covers
     # responses where the gateway elided per-event signals).
-    tool_calls: list[CodexToolCall] = [
+    tool_calls = [
         CodexToolCall(
             id=tc["id"],
             call_id=tc["call_id"],
