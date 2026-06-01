@@ -438,17 +438,11 @@ class ChatCodexPlus(BaseChatModel):
             "finish_reason": completion.raw_response.get("status"),
             "response_id": completion.response_id,
         }
-        # LangChain's standard usage_metadata shape uses
-        # ``input_tokens`` / ``output_tokens`` / ``total_tokens`` —
-        # the same names Codex uses, so passthrough is direct.
-        usage_metadata: dict[str, int] | None = None
-        if usage:
-            usage_metadata = {
-                k: int(v)
-                for k, v in usage.items()
-                if k in {"input_tokens", "output_tokens", "total_tokens"}
-                and isinstance(v, (int, float))
-            } or None
+        # Build LangChain's standard usage_metadata, promoting Codex's
+        # ``input_tokens_details`` / ``output_tokens_details`` into the
+        # ``input_token_details`` / ``output_token_details`` sub-dicts so
+        # prompt-cache hits + reasoning tokens aren't silently dropped.
+        usage_metadata = _usage_metadata_from_codex(usage)
         # Convert collected Codex tool calls to LangChain ToolCall
         # shape. ``args`` is parsed from the JSON string; if parsing
         # fails (malformed model output), surface raw text in
@@ -936,16 +930,7 @@ class ChatCodexPlus(BaseChatModel):
                         )
                     )
                 if last_usage is not None and not stopped_early:
-                    usage_metadata = {
-                        k: int(v)
-                        for k, v in last_usage.items()
-                        if k in {
-                            "input_tokens",
-                            "output_tokens",
-                            "total_tokens",
-                        }
-                        and isinstance(v, (int, float))
-                    } or None
+                    usage_metadata = _usage_metadata_from_codex(last_usage)
                     if usage_metadata:
                         yield ChatGenerationChunk(
                             message=AIMessageChunk(
@@ -959,6 +944,38 @@ class ChatCodexPlus(BaseChatModel):
 
 
 # ─── Module-private helpers (kept out of class to ease tap testing) ───
+
+
+def _usage_metadata_from_codex(
+    usage: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Build a LangChain ``usage_metadata`` dict from Codex's OpenAI-Responses-
+    style ``usage``.
+
+    Beyond the flat ``input_tokens`` / ``output_tokens`` / ``total_tokens``,
+    Codex reports detail blocks — ``input_tokens_details.cached_tokens`` (prompt
+    cache hits) and ``output_tokens_details.reasoning_tokens``. Promote those
+    into LangChain's standard ``input_token_details.cache_read`` /
+    ``output_token_details.reasoning`` sub-dicts so downstream consumers can see
+    them (previously they were dropped, leaving prompt-cache reads invisible —
+    e.g. mimir reads ``input_token_details.cache_read``). Returns ``None`` when
+    there is no usable usage.
+    """
+    if not usage:
+        return None
+    um: dict[str, Any] = {
+        k: int(v)
+        for k, v in usage.items()
+        if k in {"input_tokens", "output_tokens", "total_tokens"}
+        and isinstance(v, (int, float))
+    }
+    cached = (usage.get("input_tokens_details") or {}).get("cached_tokens")
+    if isinstance(cached, (int, float)) and not isinstance(cached, bool):
+        um["input_token_details"] = {"cache_read": int(cached)}
+    reasoning = (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+    if isinstance(reasoning, (int, float)) and not isinstance(reasoning, bool):
+        um["output_token_details"] = {"reasoning": int(reasoning)}
+    return um or None
 
 
 def _tap_text_deltas_sync(
@@ -1141,12 +1158,7 @@ def _yield_chunks_sync(
             message=AIMessageChunk(content=hold_buffer, id=response_id)
         )
     if last_usage is not None:
-        usage_metadata = {
-            k: int(v)
-            for k, v in last_usage.items()
-            if k in {"input_tokens", "output_tokens", "total_tokens"}
-            and isinstance(v, (int, float))
-        } or None
+        usage_metadata = _usage_metadata_from_codex(last_usage)
         if usage_metadata:
             yield ChatGenerationChunk(
                 message=AIMessageChunk(
