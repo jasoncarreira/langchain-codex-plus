@@ -552,13 +552,21 @@ class ChatCodexPlus(BaseChatModel):
             return
         body_bytes = response.read()
         err = parse_error_body(body_bytes)
-        # Re-raise with status code prepended so callers can pattern-
-        # match on it.
+        # Surface the rate-limit headers on errors too (esp. 429): fire
+        # the callback so the usage snapshot updates even on a refusal,
+        # and attach status_code + headers + parsed limits to the
+        # exception. Previously these were discarded — this method ran
+        # BEFORE _fire_rate_limit_callback on the success path, so a 429
+        # gave callers no reset timestamp to pause on.
+        rate_limits = self._fire_rate_limit_callback(response.headers)
         raise CodexResponseError(
             message=f"HTTP {response.status_code}: {err.message}",
             code=err.code,
             type=err.type,
             raw=err.raw,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            rate_limits=rate_limits,
         )
 
     def _consume_sync(
@@ -686,11 +694,17 @@ class ChatCodexPlus(BaseChatModel):
             return
         body_bytes = await response.aread()
         err = parse_error_body(body_bytes)
+        # See _raise_for_http_error: surface rate-limit headers on errors
+        # so a 429 carries its reset timestamp instead of being opaque.
+        rate_limits = self._fire_rate_limit_callback(response.headers)
         raise CodexResponseError(
             message=f"HTTP {response.status_code}: {err.message}",
             code=err.code,
             type=err.type,
             raw=err.raw,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            rate_limits=rate_limits,
         )
 
     async def _consume_async(

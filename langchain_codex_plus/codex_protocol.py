@@ -746,15 +746,31 @@ class CodexResponseError(RuntimeError):
         code: str | None = None,
         type: str | None = None,
         raw: Any = None,
+        status_code: int | None = None,
+        headers: dict[str, str] | None = None,
+        rate_limits: Any = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.code = code
         self.type = type
         self.raw = raw
+        # HTTP envelope context — populated for non-2xx responses so
+        # callers can pattern-match on the status and, crucially, read
+        # the rate-limit headers on a 429 (the reset timestamp lives in
+        # ``x-codex-primary-reset-at`` / ``-reset-after-seconds``). These
+        # used to be discarded; a caller hitting a 429 had no way to know
+        # when the window would roll over. ``rate_limits`` is the parsed
+        # :class:`~langchain_codex_plus.rate_limits.CodexRateLimits` (or
+        # ``None`` when the response carried no ``x-codex-*`` headers).
+        self.status_code = status_code
+        self.headers = headers
+        self.rate_limits = rate_limits
 
     def __repr__(self) -> str:
         bits = [f"message={self.message!r}"]
+        if self.status_code is not None:
+            bits.append(f"status_code={self.status_code!r}")
         if self.code:
             bits.append(f"code={self.code!r}")
         if self.type:
