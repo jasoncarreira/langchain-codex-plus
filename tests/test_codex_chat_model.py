@@ -290,6 +290,50 @@ def test_generate_raises_on_oai_error_shape(auth_file):
     assert exc.value.type == "invalid_request_error"
 
 
+def test_generate_429_surfaces_rate_limit_headers(auth_file):
+    """A 429 must surface status_code + headers + parsed rate_limits on
+    the exception (so callers can pause until the real window reset) AND
+    fire the rate-limit callback even on the refusal. Previously the
+    headers were discarded — _raise_for_http_error ran before the
+    callback on the success path, so a 429 was opaque."""
+    transport = _CaptureTransport(
+        status_code=429,
+        body=b'{"detail":"Rate limit exceeded"}',
+        headers=_real_rl_headers(),
+    )
+    seen: list[CodexRateLimits] = []
+    llm = _make_llm(
+        auth_file, transport=transport, rate_limit_callback=seen.append
+    )
+    with pytest.raises(CodexResponseError) as exc:
+        llm.invoke([HumanMessage("hi")])
+    err = exc.value
+    assert err.status_code == 429
+    assert err.headers is not None
+    assert err.headers.get("x-codex-primary-reset-at") == "1779343790"
+    assert err.rate_limits is not None
+    assert err.rate_limits.primary is not None
+    assert err.rate_limits.primary.reset_at == 1779343790
+    # The callback fired on the 429 (usage snapshot updates on refusals).
+    assert len(seen) == 1
+    assert seen[0].primary.reset_at == 1779343790
+
+
+def test_generate_429_without_codex_headers_still_sets_status(auth_file):
+    """A 429 with no ``x-codex-*`` headers still carries status_code (and
+    rate_limits is None) — callers fall back to a backoff."""
+    transport = _CaptureTransport(
+        status_code=429,
+        body=b'{"detail":"Rate limit exceeded"}',
+        headers={"Content-Type": "application/json"},
+    )
+    llm = _make_llm(auth_file, transport=transport)
+    with pytest.raises(CodexResponseError) as exc:
+        llm.invoke([HumanMessage("hi")])
+    assert exc.value.status_code == 429
+    assert exc.value.rate_limits is None
+
+
 def test_generate_stop_argument_is_ignored_silently(auth_file, caplog):
     """Codex Responses API doesn't expose stop sequences. We log at
     DEBUG and proceed — silent drop in production logs."""
