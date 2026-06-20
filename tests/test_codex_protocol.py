@@ -362,3 +362,63 @@ def test_parse_error_body_handles_garbage():
 def test_parse_error_body_empty():
     err = parse_error_body(b"")
     assert err.message == "<empty response body>"
+
+
+# ─── async incremental SSE parsing (0.0.4) ─────────────────────────────
+
+
+async def test_aparse_sse_stream_matches_sync_parser():
+    """The async parser yields identical events to the sync one."""
+    import asyncio  # noqa: F401 — parity check only
+
+    from langchain_codex_plus.codex_protocol import aparse_sse_stream
+
+    raw = [
+        "event: response.created",
+        'data: {"response": {"id": "r1"}}',
+        "",
+        "event: response.output_text.delta",
+        'data: {"delta": "hi"}',
+        "",
+        "event: response.completed",
+        'data: {"response": {"id": "r1"}}',
+        "",
+    ]
+
+    async def alines():
+        for line in raw:
+            yield line
+
+    got = [(e.event, e.data) async for e in aparse_sse_stream(alines())]
+    expected = [(e.event, e.data) for e in parse_sse_stream(raw)]
+    assert got == expected
+
+
+async def test_aparse_sse_stream_yields_before_stream_completes():
+    """The async parser yields each event AS its lines arrive, without
+    draining the rest of the stream — the property that lets ``_astream``
+    surface Codex token deltas in real time instead of post-completion."""
+    import asyncio
+
+    from langchain_codex_plus.codex_protocol import aparse_sse_stream
+
+    gate = asyncio.Event()
+
+    async def alines():
+        yield "event: response.output_text.delta"
+        yield 'data: {"delta": "hel"}'
+        yield ""  # boundary → first event flushes here
+        # Block until the consumer has the first event; if the parser had
+        # to drain the whole stream before yielding, this would deadlock.
+        await gate.wait()
+        yield "event: response.output_text.delta"
+        yield 'data: {"delta": "lo"}'
+        yield ""
+
+    agen = aparse_sse_stream(alines())
+    first = await agen.__anext__()
+    assert first.data["delta"] == "hel"  # arrived while producer is blocked
+    gate.set()
+    second = await agen.__anext__()
+    assert second.data["delta"] == "lo"
+    await agen.aclose()

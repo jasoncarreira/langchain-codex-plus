@@ -28,6 +28,7 @@ from langchain_codex_plus.codex_protocol import (
     CodexToolCall,
     SseEvent,
     ToolChoice,
+    aparse_sse_stream,
     build_request_body,
     consume_events,
     parse_error_body,
@@ -66,6 +67,7 @@ __all__ = [
     "build_request_body",
     "consume_events",
     "parse_error_body",
+    "aparse_sse_stream",
     "parse_sse_stream",
     # rate_limits
     "CodexCredits",

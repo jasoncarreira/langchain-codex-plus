@@ -34,7 +34,7 @@ body when the HTTP envelope is non-200; both shapes carry
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -398,6 +398,62 @@ class SseEvent:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+class _SseLineParser:
+    """Incremental SSE line parser shared by the sync + async stream parsers.
+
+    Feed lines one at a time: ``feed`` returns a completed :class:`SseEvent`
+    on each event boundary (blank line); ``close`` flushes a trailing event
+    with no final blank line. Splitting the per-line logic out lets the async
+    parser stream events AS LINES ARRIVE instead of buffering the whole
+    response first — the previous ``_astream`` did the latter, which collapsed
+    Codex's token-level SSE deltas into one post-completion burst.
+    """
+
+    def __init__(self) -> None:
+        self._event: str = ""
+        self._data: list[str] = []
+
+    def feed(self, line: str) -> SseEvent | None:
+        # SSE lines are LF-separated; strip a trailing ``\r\n`` if present.
+        line = line.rstrip("\r\n")
+        if not line:
+            # Empty line = event boundary.
+            return self._flush()
+        if line.startswith(":"):
+            # SSE comment line — heartbeat / keepalive. Ignore.
+            return None
+        if line.startswith("event:"):
+            self._event = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            self._data.append(line[len("data:"):].lstrip())
+        # Ignore unknown SSE fields (``id:``, ``retry:``) — Codex
+        # doesn't use them today.
+        return None
+
+    def close(self) -> SseEvent | None:
+        # Trailing event without a final blank line (rare; defensive).
+        return self._flush()
+
+    def _flush(self) -> SseEvent | None:
+        if not self._event and not self._data:
+            return None
+        raw_data = "\n".join(self._data)
+        parsed: dict[str, Any]
+        if not raw_data:
+            parsed = {}
+        else:
+            try:
+                parsed = json.loads(raw_data)
+                if not isinstance(parsed, dict):
+                    parsed = {"_raw": parsed}
+            except json.JSONDecodeError:
+                parsed = {}
+        evt = SseEvent(event=self._event, data=parsed)
+        self._event = ""
+        self._data = []
+        return evt
+
+
 def parse_sse_stream(lines: Iterable[str]) -> Iterator[SseEvent]:
     """Parse Codex's SSE byte stream into :class:`SseEvent` objects.
 
@@ -414,51 +470,31 @@ def parse_sse_stream(lines: Iterable[str]) -> Iterator[SseEvent]:
       text dropped (we err on the side of "keep streaming" over
       "crash mid-response").
     """
-    current_event: str = ""
-    data_buffer: list[str] = []
-
-    def flush() -> SseEvent | None:
-        nonlocal current_event, data_buffer
-        if not current_event and not data_buffer:
-            return None
-        raw_data = "\n".join(data_buffer)
-        parsed: dict[str, Any]
-        if not raw_data:
-            parsed = {}
-        else:
-            try:
-                parsed = json.loads(raw_data)
-                if not isinstance(parsed, dict):
-                    parsed = {"_raw": parsed}
-            except json.JSONDecodeError:
-                parsed = {}
-        evt = SseEvent(event=current_event, data=parsed)
-        current_event = ""
-        data_buffer = []
-        return evt
-
+    parser = _SseLineParser()
     for line in lines:
-        # SSE lines are LF-separated; if iterable yields with trailing
-        # ``\r\n`` strip it.
-        line = line.rstrip("\r\n")
-        if not line:
-            # Empty line = event boundary.
-            evt = flush()
-            if evt is not None:
-                yield evt
-            continue
-        if line.startswith(":"):
-            # SSE comment line — heartbeat / keepalive. Ignore.
-            continue
-        if line.startswith("event:"):
-            current_event = line[len("event:"):].strip()
-        elif line.startswith("data:"):
-            data_buffer.append(line[len("data:"):].lstrip())
-        # Ignore unknown SSE fields (``id:``, ``retry:``) — Codex
-        # doesn't use them today.
+        evt = parser.feed(line)
+        if evt is not None:
+            yield evt
+    final = parser.close()
+    if final is not None:
+        yield final
 
-    # Trailing event without a final blank line (rare; defensive).
-    final = flush()
+
+async def aparse_sse_stream(lines: AsyncIterator[str]) -> AsyncIterator[SseEvent]:
+    """Async counterpart to :func:`parse_sse_stream`.
+
+    Consumes an async line iterator (e.g. ``httpx.Response.aiter_lines()``)
+    and yields :class:`SseEvent` objects AS LINES ARRIVE — so the chat model's
+    ``_astream`` streams Codex's token-level deltas in real time instead of
+    buffering the whole response first. Identical parsing semantics to the
+    sync version (both share :class:`_SseLineParser`).
+    """
+    parser = _SseLineParser()
+    async for line in lines:
+        evt = parser.feed(line)
+        if evt is not None:
+            yield evt
+    final = parser.close()
     if final is not None:
         yield final
 

@@ -99,6 +99,7 @@ from langchain_codex_plus.codex_protocol import (
     CodexResponseError,
     SseEvent,
     ToolChoice,
+    aparse_sse_stream,
     build_request_body,
     consume_events,
     first_stop_match,
@@ -786,10 +787,11 @@ class ChatCodexPlus(BaseChatModel):
             try:
                 await self._araise_for_http_error(response)
                 self._fire_rate_limit_callback(response.headers)
-                lines: list[str] = []
-                async for line in response.aiter_lines():
-                    lines.append(line)
-                events = parse_sse_stream(lines)
+                # Stream events as lines arrive (aparse_sse_stream consumes the
+                # async line iterator incrementally) so token-level deltas reach
+                # callers in real time. Previously this buffered the whole
+                # response into a list before parsing, collapsing the stream.
+                events = aparse_sse_stream(response.aiter_lines())
                 # Mirror of ``_yield_chunks_sync`` for the async path —
                 # kept inline so callers can ``await
                 # run_manager.on_llm_new_token`` on each text delta.
@@ -809,7 +811,7 @@ class ChatCodexPlus(BaseChatModel):
                     max((len(s) for s in stop), default=0) if stop else 0
                 )
                 stopped_early = False
-                for ev in events:
+                async for ev in events:
                     if ev.event == "response.created":
                         resp = ev.data.get("response") or {}
                         if isinstance(resp, dict):
