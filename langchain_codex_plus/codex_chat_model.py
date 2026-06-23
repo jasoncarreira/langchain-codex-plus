@@ -99,11 +99,13 @@ from langchain_codex_plus.codex_protocol import (
     CodexResponseError,
     SseEvent,
     ToolChoice,
+    aparse_sse_stream,
     build_request_body,
     consume_events,
     first_stop_match,
     parse_error_body,
     parse_sse_stream,
+    summarize_request_content,
 )
 from langchain_codex_plus.rate_limits import (
     CodexRateLimits,
@@ -517,7 +519,7 @@ class ChatCodexPlus(BaseChatModel):
                         response.close()
                         auth = self._refresh_auth_sync()
                         continue
-                    self._raise_for_http_error(response)
+                    self._raise_for_http_error(response, body)
                     self._fire_rate_limit_callback(response.headers)
                     completion = self._consume_sync(
                         response, run_manager, stop=stop
@@ -544,21 +546,38 @@ class ChatCodexPlus(BaseChatModel):
         )
         return client.send(req, stream=True)
 
-    def _raise_for_http_error(self, response: httpx.Response) -> None:
+    def _raise_for_http_error(
+        self, response: httpx.Response, body: dict[str, Any] | None = None
+    ) -> None:
         """If the HTTP envelope is non-2xx, read the body, parse the
         error, and raise. Reads the body so the connection can close
-        cleanly."""
+        cleanly. ``body`` is the request payload, attached to the error
+        as a PII-light ``request_summary`` so content rejections (e.g.
+        ``400: Unsupported content type``) are self-describing."""
         if 200 <= response.status_code < 300:
             return
         body_bytes = response.read()
         err = parse_error_body(body_bytes)
-        # Re-raise with status code prepended so callers can pattern-
-        # match on it.
+        # Surface the rate-limit headers on errors too (esp. 429): fire
+        # the callback so the usage snapshot updates even on a refusal,
+        # and attach status_code + headers + parsed limits to the
+        # exception. Previously these were discarded — this method ran
+        # BEFORE _fire_rate_limit_callback on the success path, so a 429
+        # gave callers no reset timestamp to pause on.
+        rate_limits = self._fire_rate_limit_callback(response.headers)
         raise CodexResponseError(
             message=f"HTTP {response.status_code}: {err.message}",
             code=err.code,
             type=err.type,
             raw=err.raw,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            rate_limits=rate_limits,
+            request_summary=(
+                summarize_request_content(body)
+                if isinstance(body, dict)
+                else None
+            ),
         )
 
     def _consume_sync(
@@ -612,7 +631,7 @@ class ChatCodexPlus(BaseChatModel):
                         response.close()
                         auth = self._refresh_auth_sync()
                         continue
-                    self._raise_for_http_error(response)
+                    self._raise_for_http_error(response, body)
                     self._fire_rate_limit_callback(response.headers)
                     yield from _yield_chunks_sync(
                         parse_sse_stream(response.iter_lines()),
@@ -656,7 +675,7 @@ class ChatCodexPlus(BaseChatModel):
                         await response.aclose()
                         auth = await self._refresh_auth_async()
                         continue
-                    await self._araise_for_http_error(response)
+                    await self._araise_for_http_error(response, body)
                     self._fire_rate_limit_callback(response.headers)
                     completion = await self._consume_async(
                         response, run_manager, stop=stop
@@ -681,16 +700,29 @@ class ChatCodexPlus(BaseChatModel):
         )
         return await client.send(req, stream=True)
 
-    async def _araise_for_http_error(self, response: httpx.Response) -> None:
+    async def _araise_for_http_error(
+        self, response: httpx.Response, body: dict[str, Any] | None = None
+    ) -> None:
         if 200 <= response.status_code < 300:
             return
         body_bytes = await response.aread()
         err = parse_error_body(body_bytes)
+        # See _raise_for_http_error: surface rate-limit headers on errors
+        # so a 429 carries its reset timestamp instead of being opaque.
+        rate_limits = self._fire_rate_limit_callback(response.headers)
         raise CodexResponseError(
             message=f"HTTP {response.status_code}: {err.message}",
             code=err.code,
             type=err.type,
             raw=err.raw,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            rate_limits=rate_limits,
+            request_summary=(
+                summarize_request_content(body)
+                if isinstance(body, dict)
+                else None
+            ),
         )
 
     async def _consume_async(
@@ -770,12 +802,13 @@ class ChatCodexPlus(BaseChatModel):
                 # left open for ``aiter_lines`` use.
                 break
             try:
-                await self._araise_for_http_error(response)
+                await self._araise_for_http_error(response, body)
                 self._fire_rate_limit_callback(response.headers)
-                lines: list[str] = []
-                async for line in response.aiter_lines():
-                    lines.append(line)
-                events = parse_sse_stream(lines)
+                # Stream events as lines arrive (aparse_sse_stream consumes the
+                # async line iterator incrementally) so token-level deltas reach
+                # callers in real time. Previously this buffered the whole
+                # response into a list before parsing, collapsing the stream.
+                events = aparse_sse_stream(response.aiter_lines())
                 # Mirror of ``_yield_chunks_sync`` for the async path —
                 # kept inline so callers can ``await
                 # run_manager.on_llm_new_token`` on each text delta.
@@ -795,7 +828,7 @@ class ChatCodexPlus(BaseChatModel):
                     max((len(s) for s in stop), default=0) if stop else 0
                 )
                 stopped_early = False
-                for ev in events:
+                async for ev in events:
                     if ev.event == "response.created":
                         resp = ev.data.get("response") or {}
                         if isinstance(resp, dict):

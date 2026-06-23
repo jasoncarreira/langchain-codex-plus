@@ -28,10 +28,12 @@ from langchain_codex_plus.codex_protocol import (
     CodexToolCall,
     SseEvent,
     ToolChoice,
+    aparse_sse_stream,
     build_request_body,
     consume_events,
     parse_error_body,
     parse_sse_stream,
+    summarize_request_content,
 )
 from langchain_codex_plus.rate_limits import (
     CodexCredits,
@@ -40,7 +42,7 @@ from langchain_codex_plus.rate_limits import (
     parse_codex_rate_limits,
 )
 
-__version__ = "0.0.1"
+__version__ = "0.0.5"
 
 __all__ = [
     # codex_auth
@@ -66,7 +68,9 @@ __all__ = [
     "build_request_body",
     "consume_events",
     "parse_error_body",
+    "aparse_sse_stream",
     "parse_sse_stream",
+    "summarize_request_content",
     # rate_limits
     "CodexCredits",
     "CodexQuotaWindow",
