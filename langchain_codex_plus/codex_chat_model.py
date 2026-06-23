@@ -105,6 +105,7 @@ from langchain_codex_plus.codex_protocol import (
     first_stop_match,
     parse_error_body,
     parse_sse_stream,
+    summarize_request_content,
 )
 from langchain_codex_plus.rate_limits import (
     CodexRateLimits,
@@ -518,7 +519,7 @@ class ChatCodexPlus(BaseChatModel):
                         response.close()
                         auth = self._refresh_auth_sync()
                         continue
-                    self._raise_for_http_error(response)
+                    self._raise_for_http_error(response, body)
                     self._fire_rate_limit_callback(response.headers)
                     completion = self._consume_sync(
                         response, run_manager, stop=stop
@@ -545,10 +546,14 @@ class ChatCodexPlus(BaseChatModel):
         )
         return client.send(req, stream=True)
 
-    def _raise_for_http_error(self, response: httpx.Response) -> None:
+    def _raise_for_http_error(
+        self, response: httpx.Response, body: dict[str, Any] | None = None
+    ) -> None:
         """If the HTTP envelope is non-2xx, read the body, parse the
         error, and raise. Reads the body so the connection can close
-        cleanly."""
+        cleanly. ``body`` is the request payload, attached to the error
+        as a PII-light ``request_summary`` so content rejections (e.g.
+        ``400: Unsupported content type``) are self-describing."""
         if 200 <= response.status_code < 300:
             return
         body_bytes = response.read()
@@ -568,6 +573,11 @@ class ChatCodexPlus(BaseChatModel):
             status_code=response.status_code,
             headers=dict(response.headers),
             rate_limits=rate_limits,
+            request_summary=(
+                summarize_request_content(body)
+                if isinstance(body, dict)
+                else None
+            ),
         )
 
     def _consume_sync(
@@ -621,7 +631,7 @@ class ChatCodexPlus(BaseChatModel):
                         response.close()
                         auth = self._refresh_auth_sync()
                         continue
-                    self._raise_for_http_error(response)
+                    self._raise_for_http_error(response, body)
                     self._fire_rate_limit_callback(response.headers)
                     yield from _yield_chunks_sync(
                         parse_sse_stream(response.iter_lines()),
@@ -665,7 +675,7 @@ class ChatCodexPlus(BaseChatModel):
                         await response.aclose()
                         auth = await self._refresh_auth_async()
                         continue
-                    await self._araise_for_http_error(response)
+                    await self._araise_for_http_error(response, body)
                     self._fire_rate_limit_callback(response.headers)
                     completion = await self._consume_async(
                         response, run_manager, stop=stop
@@ -690,7 +700,9 @@ class ChatCodexPlus(BaseChatModel):
         )
         return await client.send(req, stream=True)
 
-    async def _araise_for_http_error(self, response: httpx.Response) -> None:
+    async def _araise_for_http_error(
+        self, response: httpx.Response, body: dict[str, Any] | None = None
+    ) -> None:
         if 200 <= response.status_code < 300:
             return
         body_bytes = await response.aread()
@@ -706,6 +718,11 @@ class ChatCodexPlus(BaseChatModel):
             status_code=response.status_code,
             headers=dict(response.headers),
             rate_limits=rate_limits,
+            request_summary=(
+                summarize_request_content(body)
+                if isinstance(body, dict)
+                else None
+            ),
         )
 
     async def _consume_async(
@@ -785,7 +802,7 @@ class ChatCodexPlus(BaseChatModel):
                 # left open for ``aiter_lines`` use.
                 break
             try:
-                await self._araise_for_http_error(response)
+                await self._araise_for_http_error(response, body)
                 self._fire_rate_limit_callback(response.headers)
                 # Stream events as lines arrive (aparse_sse_stream consumes the
                 # async line iterator incrementally) so token-level deltas reach

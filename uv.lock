@@ -253,7 +253,7 @@ wheels = [
 
 [[package]]
 name = "langchain-codex-plus"
-version = "0.0.4"
+version = "0.0.5"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

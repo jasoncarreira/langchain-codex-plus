@@ -164,6 +164,34 @@ def _coerce_message_content_to_text(message: Any) -> str:
 # Codex ``ImageDetail`` from app-server-protocol/ContentItem.ts.
 _VALID_IMAGE_DETAILS = frozenset({"auto", "low", "high"})
 
+# Image MIME types the Codex vision backend accepts. A ``data:``/base64
+# image with any other MIME (svg, tiff, heic, avif, bmp, …) is rejected by
+# ``/codex/responses`` with ``HTTP 400: Unsupported content type``, which
+# fails the entire turn. We drop such blocks rather than send a request the
+# backend is guaranteed to refuse.
+_SUPPORTED_IMAGE_MIMES = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp"}
+)
+
+
+def _data_url_mime(url: str) -> str | None:
+    """Return the MIME of a ``data:<mime>[;base64],...`` URL, or ``None``
+    for non-data URLs (``http(s)://`` — whose remote content type is only
+    knowable to the backend on fetch, so we can't validate it here)."""
+    if not url.startswith("data:"):
+        return None
+    return (
+        url[len("data:"):].split(",", 1)[0].split(";", 1)[0].strip().lower()
+        or None
+    )
+
+
+def _is_supported_image_url(url: str) -> bool:
+    """``False`` only for a ``data:`` image whose MIME isn't in
+    :data:`_SUPPORTED_IMAGE_MIMES`. Remote URLs pass (validated backend-side)."""
+    mime = _data_url_mime(url)
+    return mime is None or mime in _SUPPORTED_IMAGE_MIMES
+
 
 def _coerce_to_codex_blocks(
     message: Any, *, role: str
@@ -259,17 +287,25 @@ def _try_extract_image_block(
 ) -> dict[str, Any] | None:
     """Map a LangChain image block to a Codex ``input_image`` block.
 
-    Returns ``None`` if the block isn't an image variant or doesn't
-    carry the URL/data needed to construct one.
+    Returns ``None`` if the block isn't an image variant, doesn't carry
+    the URL/data needed to construct one, or is a ``data:``/base64 image
+    whose MIME the Codex backend doesn't accept. The last case is dropped
+    rather than sent because ``/codex/responses`` rejects unsupported
+    image types with ``HTTP 400: Unsupported content type``, which fails
+    the whole turn (a dropped image degrades one turn; a 400 kills it).
     """
     # Convention 1 / 2: ``{"type": "image_url", "image_url": <str|dict>}``
     if btype == "image_url":
         iu = block.get("image_url")
         if isinstance(iu, str) and iu:
+            if not _is_supported_image_url(iu):
+                return None
             return {"type": "input_image", "image_url": iu}
         if isinstance(iu, dict):
             url = iu.get("url")
             if not isinstance(url, str) or not url:
+                return None
+            if not _is_supported_image_url(url):
                 return None
             out: dict[str, Any] = {"type": "input_image", "image_url": url}
             detail = iu.get("detail")
@@ -283,6 +319,8 @@ def _try_extract_image_block(
         if source_type == "url":
             url = block.get("url")
             if isinstance(url, str) and url:
+                if not _is_supported_image_url(url):
+                    return None
                 out = {"type": "input_image", "image_url": url}
                 detail = block.get("detail")
                 if isinstance(detail, str) and detail in _VALID_IMAGE_DETAILS:
@@ -291,7 +329,9 @@ def _try_extract_image_block(
             return None
         if source_type == "base64":
             data = block.get("data")
-            mime = block.get("mime_type") or "image/png"
+            mime = str(block.get("mime_type") or "image/png").strip().lower()
+            if mime not in _SUPPORTED_IMAGE_MIMES:
+                return None
             if isinstance(data, str) and data:
                 return {
                     "type": "input_image",
@@ -300,6 +340,80 @@ def _try_extract_image_block(
             return None
         return None
     return None
+
+
+def summarize_request_content(body: dict[str, Any]) -> dict[str, Any]:
+    """PII-light inventory of a Codex request's content, for attaching to a
+    :class:`CodexResponseError` so an ``HTTP 400: Unsupported content type``
+    (and similar content rejections) becomes self-describing without leaking
+    conversation text.
+
+    Captures only structural facts — content-part ``type`` counts per role,
+    image MIME/scheme, function-call presence, and sizes — never raw message
+    text. Any content-part ``type`` outside the schema's known set is surfaced
+    under ``unexpected_content_types`` (the prime suspect for a rejection).
+    """
+    known_part_types = {"input_text", "output_text", "input_image", "input_file"}
+    entries = body.get("input")
+    if not isinstance(entries, list):
+        entries = []
+    types_by_role: dict[str, dict[str, int]] = {}
+    images: list[dict[str, str]] = []
+    unexpected_types: set[str] = set()
+    approx_chars = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        etype = entry.get("type")
+        # Top-level non-message items (function_call / function_call_output).
+        if etype in {"function_call", "function_call_output"}:
+            bucket = types_by_role.setdefault(str(etype), {})
+            bucket["_count"] = bucket.get("_count", 0) + 1
+            payload = entry.get("output") or entry.get("arguments")
+            if isinstance(payload, str):
+                approx_chars += len(payload)
+            continue
+        role = str(entry.get("role") or etype or "?")
+        bucket = types_by_role.setdefault(role, {})
+        content = entry.get("content")
+        if isinstance(content, str):
+            bucket["<str>"] = bucket.get("<str>", 0) + 1
+            approx_chars += len(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = str(part.get("type") or "?")
+            bucket[ptype] = bucket.get(ptype, 0) + 1
+            if ptype not in known_part_types:
+                unexpected_types.add(ptype)
+            text = part.get("text")
+            if isinstance(text, str):
+                approx_chars += len(text)
+            if ptype == "input_image" or "image" in ptype:
+                iu = part.get("image_url") or part.get("url")
+                info: dict[str, str] = {"role": role}
+                if isinstance(iu, str) and iu:
+                    if iu.startswith("data:"):
+                        info["mime"] = _data_url_mime(iu) or "?"
+                    else:
+                        info["scheme"] = iu.split("://", 1)[0] if "://" in iu else "?"
+                elif isinstance(iu, dict):
+                    info["image_url_obj"] = "1"
+                images.append(info)
+    instructions = body.get("instructions")
+    tools = body.get("tools")
+    return {
+        "message_count": len(entries),
+        "content_types_by_role": types_by_role,
+        "images": images,
+        "unexpected_content_types": sorted(unexpected_types),
+        "approx_content_chars": approx_chars,
+        "instructions_chars": len(instructions) if isinstance(instructions, str) else 0,
+        "tools_count": len(tools) if isinstance(tools, list) else 0,
+    }
 
 
 def _extract_instructions(messages: Iterable[Any]) -> str:
@@ -785,6 +899,7 @@ class CodexResponseError(RuntimeError):
         status_code: int | None = None,
         headers: dict[str, str] | None = None,
         rate_limits: Any = None,
+        request_summary: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -802,6 +917,11 @@ class CodexResponseError(RuntimeError):
         self.status_code = status_code
         self.headers = headers
         self.rate_limits = rate_limits
+        # Structured, PII-light inventory of the *request* content
+        # (content-part type counts, image MIME/scheme, sizes) — populated
+        # for HTTP error envelopes so a content rejection names itself.
+        # Never carries raw message text. See ``summarize_request_content``.
+        self.request_summary = request_summary
 
     def __repr__(self) -> str:
         bits = [f"message={self.message!r}"]
@@ -811,6 +931,8 @@ class CodexResponseError(RuntimeError):
             bits.append(f"code={self.code!r}")
         if self.type:
             bits.append(f"type={self.type!r}")
+        if self.request_summary:
+            bits.append(f"request_summary={self.request_summary!r}")
         return f"CodexResponseError({', '.join(bits)})"
 
 
