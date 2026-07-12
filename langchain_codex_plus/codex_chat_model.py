@@ -115,17 +115,26 @@ from langchain_codex_plus.rate_limits import (
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_USER_AGENT = "langchain-codex-plus/0.0.1"
-_DEFAULT_ORIGINATOR = "langchain_codex_plus"
-"""Originator header value. Codex's default is ``codex_cli_rs``; we
-distinguish ourselves so server-side telemetry can tell our traffic
-apart from real Codex CLI traffic. Override via the ``originator``
-field if you need a more specific label for your application."""
+#: Codex client version we present. Newer gpt-5.x models (e.g.
+#: ``gpt-5.6-luna``) are gated behind a minimum Codex version AND the real
+#: Codex client identity — a request that isn't recognized as ``codex_cli_rs``
+#: with a new-enough version is refused (404 "Model not found" / 400 "requires a
+#: newer version of Codex"). Bump this as the floor rises. Track the pinned
+#: ``@openai/codex`` CLI version in deployments.
+_CODEX_CLIENT_VERSION = "0.144.1"
 
-_DEFAULT_CLIENT_VERSION = "0.99.0"
-"""Sent as ``?client_version=<v>`` on every request. The gateway is
-lenient about exact value; we send a recent-ish stub. Override if
-Codex starts gating features by client version."""
+_DEFAULT_USER_AGENT = f"codex_cli_rs/{_CODEX_CLIENT_VERSION}"
+_DEFAULT_ORIGINATOR = "codex_cli_rs"
+"""Originator header value. Must be ``codex_cli_rs`` (the real Codex CLI
+identity) or the backend refuses newly-gated models. An earlier build used a
+distinct ``langchain_codex_plus`` label for telemetry separation, but that got
+those models rejected. Override the ``originator`` field only if you accept
+losing access to gated models."""
+
+_DEFAULT_CLIENT_VERSION = _CODEX_CLIENT_VERSION
+"""Sent as ``?client_version=<v>`` on every request. Paired with the
+``codex_cli_rs`` User-Agent + originator so the backend admits version-gated
+models. Override if Codex raises the floor."""
 
 _DEFAULT_TIMEOUT_SECONDS = 120.0
 
