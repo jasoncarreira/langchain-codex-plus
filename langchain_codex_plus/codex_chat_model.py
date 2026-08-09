@@ -139,6 +139,40 @@ models. Override if Codex raises the floor."""
 _DEFAULT_TIMEOUT_SECONDS = 120.0
 
 
+def _normalize_tool_choice(choice: Any) -> "ToolChoice | None":
+    """Translate LangChain's tool_choice vocabulary into the Codex protocol's.
+
+    The Codex endpoint accepts only ``"none"``, ``"auto"``, ``"required"`` or a
+    ``{"type": "function", "name": ...}`` dict. LangChain callers legitimately
+    supply other spellings, and one arrives without the caller choosing it at
+    all: ``BaseChatModel.with_structured_output`` -- the generic implementation
+    every model inherits unless it overrides it -- calls
+    ``bind_tools(..., tool_choice="any")``. ``"any"`` is Anthropic vocabulary,
+    so passing it straight through produces::
+
+        HTTP 400: Invalid value: 'any'. Supported values are: 'none', 'auto',
+        and 'required'.
+
+    which kills any turn that reaches a structured-output call. ``ChatOpenAI``
+    avoids it by overriding ``with_structured_output``; normalizing here fixes
+    that path and every other caller using the same vocabulary, including
+    ``True``/``False`` and a bare tool name.
+    """
+    if choice is None:
+        return None
+    if isinstance(choice, bool):
+        return "required" if choice else "none"
+    if isinstance(choice, dict):
+        return choice
+    if isinstance(choice, str):
+        if choice in ("none", "auto", "required"):
+            return choice
+        if choice == "any":
+            return "required"
+        return {"type": "function", "name": choice}
+    return choice
+
+
 class ChatCodexPlus(BaseChatModel):
     """LangChain chat model wrapping the Codex Plus subscription API.
 
@@ -332,9 +366,10 @@ class ChatCodexPlus(BaseChatModel):
                 # Chat-Completions shape; unwrap it.
                 fn_dict = fn_dict["function"]
             codex_tools.append({"type": "function", **fn_dict})
+        chosen = tool_choice if tool_choice is not None else self.tool_choice
         return self.bind(
             tools=codex_tools,
-            tool_choice=tool_choice if tool_choice is not None else self.tool_choice,
+            tool_choice=_normalize_tool_choice(chosen),
             **kwargs,
         )
 

@@ -461,3 +461,55 @@ def test_real_account_smoke():
     assert msg.content.strip()
     assert msg.usage_metadata is not None
     assert msg.usage_metadata.get("total_tokens", 0) > 0
+
+
+# ── tool_choice normalization (the with_structured_output 400) ──────────────
+
+
+def test_normalize_tool_choice_translates_anthropic_any_to_required() -> None:
+    """`BaseChatModel.with_structured_output` calls bind_tools(tool_choice="any").
+
+    "any" is Anthropic vocabulary. The Codex endpoint accepts only none/auto/
+    required, so passing it through returns HTTP 400 and kills the turn. Every
+    model that does not override with_structured_output inherits that call, so
+    this is reached without any caller choosing it.
+    """
+    from langchain_codex_plus.codex_chat_model import _normalize_tool_choice
+
+    assert _normalize_tool_choice("any") == "required"
+
+
+@pytest.mark.parametrize("value", ["none", "auto", "required"])
+def test_normalize_tool_choice_passes_protocol_values_through(value: str) -> None:
+    from langchain_codex_plus.codex_chat_model import _normalize_tool_choice
+
+    assert _normalize_tool_choice(value) == value
+
+
+def test_normalize_tool_choice_handles_booleans_and_names_and_dicts() -> None:
+    from langchain_codex_plus.codex_chat_model import _normalize_tool_choice
+
+    assert _normalize_tool_choice(True) == "required"
+    assert _normalize_tool_choice(False) == "none"
+    assert _normalize_tool_choice(None) is None
+    # A bare tool name, which ChatOpenAI also accepts.
+    assert _normalize_tool_choice("my_tool") == {"type": "function", "name": "my_tool"}
+    passthrough = {"type": "function", "name": "already_shaped"}
+    assert _normalize_tool_choice(passthrough) == passthrough
+
+
+def test_bind_tools_normalizes_before_the_request_is_built() -> None:
+    """End-to-end through bind_tools, not just the helper.
+
+    Testing the helper alone would pass even if bind_tools never called it --
+    which is exactly how this bug shipped.
+    """
+    from langchain_codex_plus.codex_chat_model import ChatCodexPlus
+
+    def sample_tool(x: int) -> int:
+        """Double a number."""
+        return x * 2
+
+    model = ChatCodexPlus(model="gpt-5.6-sol")
+    bound = model.bind_tools([sample_tool], tool_choice="any")
+    assert bound.kwargs["tool_choice"] == "required"
