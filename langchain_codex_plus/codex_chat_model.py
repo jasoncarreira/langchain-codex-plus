@@ -121,7 +121,7 @@ logger = logging.getLogger(__name__)
 #: with a new-enough version is refused (404 "Model not found" / 400 "requires a
 #: newer version of Codex"). Bump this as the floor rises. Track the pinned
 #: ``@openai/codex`` CLI version in deployments.
-_CODEX_CLIENT_VERSION = "0.144.1"
+_CODEX_CLIENT_VERSION = "0.153.1"
 
 _DEFAULT_USER_AGENT = f"codex_cli_rs/{_CODEX_CLIENT_VERSION}"
 _DEFAULT_ORIGINATOR = "codex_cli_rs"
