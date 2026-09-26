@@ -91,9 +91,9 @@ from langchain_codex_plus.codex_auth import (
     CODEX_API_BASE,
     CodexAuth,
     CodexAuthNotFoundError,
-    arefresh_codex_auth,
+    arefresh_codex_auth_coordinated,
     load_codex_auth,
-    refresh_codex_auth,
+    refresh_codex_auth_coordinated,
 )
 from langchain_codex_plus.codex_protocol import (
     CodexCompletion,
@@ -396,20 +396,22 @@ class ChatCodexPlus(BaseChatModel):
     # ─── Auth ───────────────────────────────────────────────────────────
 
     def _refresh_auth_sync(self) -> CodexAuth:
-        """Refresh the OAuth tokens via the ChatGPT token endpoint
-        and update the cached auth. Raises :class:`CodexAuthRefreshError`
-        on failure — permanent failures (expired/reused refresh_token)
-        require the operator to re-run ``codex login``."""
-        current = self._resolve_auth()
-        new_auth = refresh_codex_auth(current, path=self.auth_file_path)
+        """Replace the cached auth after a 401. Adopts a rotation another
+        consumer of ``auth.json`` already made; otherwise refreshes from
+        the on-disk tokens under a file lock (never from the cached
+        refresh token, which may already be spent). Raises
+        :class:`CodexAuthRefreshError` on failure — permanent failures
+        (expired/reused refresh_token) require ``codex login``."""
+        new_auth = refresh_codex_auth_coordinated(
+            self._resolve_auth(), path=self.auth_file_path
+        )
         self._auth = new_auth
         return new_auth
 
     async def _refresh_auth_async(self) -> CodexAuth:
         """Async sibling of :meth:`_refresh_auth_sync`."""
-        current = self._resolve_auth()
-        new_auth = await arefresh_codex_auth(
-            current, path=self.auth_file_path
+        new_auth = await arefresh_codex_auth_coordinated(
+            self._resolve_auth(), path=self.auth_file_path
         )
         self._auth = new_auth
         return new_auth

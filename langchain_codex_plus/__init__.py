@@ -15,11 +15,13 @@ from langchain_codex_plus.codex_auth import (
     CodexAuthNotFoundError,
     CodexAuthRefreshError,
     arefresh_codex_auth,
+    arefresh_codex_auth_coordinated,
     auth_file_path,
     codex_home,
     is_likely_expired,
     load_codex_auth,
     refresh_codex_auth,
+    refresh_codex_auth_coordinated,
 )
 from langchain_codex_plus.codex_chat_model import ChatCodexPlus
 from langchain_codex_plus.codex_protocol import (
@@ -54,11 +56,13 @@ __all__ = [
     "CodexAuthNotFoundError",
     "CodexAuthRefreshError",
     "arefresh_codex_auth",
+    "arefresh_codex_auth_coordinated",
     "auth_file_path",
     "codex_home",
     "is_likely_expired",
     "load_codex_auth",
     "refresh_codex_auth",
+    "refresh_codex_auth_coordinated",
     # codex_protocol
     "CodexCompletion",
     "CodexResponseError",
