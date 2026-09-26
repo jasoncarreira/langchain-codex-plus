@@ -104,6 +104,19 @@ llm.invoke("Count from 1 to 100", stop=["50"])
 # → "1, 2, 3, ... 49, "
 ```
 
+## Reasoning effort and client version
+
+`reasoning_effort` defaults to `None`, which omits the `reasoning` field so the
+model applies its own default. (Before 0.0.9 the default was `"none"`, which
+`gpt-6-astra` rejects; callers who relied on it and want minimal reasoning should
+now pass `reasoning_effort="none"` explicitly.) Accepted values are validated
+server-side per model, e.g. gpt-5.4 takes `none|low|medium|high|xhigh` and
+gpt-6-astra takes `low|medium|high|xhigh|max`.
+
+The package presents itself as Codex CLI `0.157.1`, which the backend uses to
+gate newer models. Set `CODEX_PLUS_CLIENT_VERSION` to present a newer version
+without waiting for a release; an explicit `client_version=` argument wins.
+
 ## Rate-limit hook
 
 Every successful `/codex/responses` response carries quota headers

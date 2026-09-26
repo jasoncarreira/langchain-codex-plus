@@ -41,7 +41,9 @@ from typing import Any
 # ─── Request building ──────────────────────────────────────────────────
 
 
-VALID_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh"})
+# Informational only: the server validates effort per model (gpt-6-astra adds
+# "max" and rejects "none"). This package does not enforce it.
+VALID_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 """For ``gpt-5.4``. Other models may accept different values; the
 chat model passes whatever the caller sets and lets the gateway
 validate (caller gets a clear 400 if it's wrong)."""
@@ -440,7 +442,7 @@ def build_request_body(
     messages: Iterable[Any],
     *,
     model: str,
-    reasoning_effort: str = "none",
+    reasoning_effort: str | None = None,
     instructions_override: str | None = None,
     store: bool = False,
     tools: list[dict[str, Any]] | None = None,
@@ -485,8 +487,9 @@ def build_request_body(
         "input": input_entries,
         "stream": True,
         "store": store,
-        "reasoning": {"effort": reasoning_effort},
     }
+    if reasoning_effort is not None:
+        body["reasoning"] = {"effort": reasoning_effort}
     if tools:
         body["tools"] = list(tools)
     if tool_choice is not None:

@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -120,21 +121,34 @@ logger = logging.getLogger(__name__)
 #: Codex client identity — a request that isn't recognized as ``codex_cli_rs``
 #: with a new-enough version is refused (404 "Model not found" / 400 "requires a
 #: newer version of Codex"). Bump this as the floor rises. Track the pinned
-#: ``@openai/codex`` CLI version in deployments.
-_CODEX_CLIENT_VERSION = "0.153.1"
+#: ``@openai/codex`` CLI version in deployments. Set
+#: ``CODEX_PLUS_CLIENT_VERSION`` to present a newer version without a release
+#: when the backend raises the floor again.
+_CODEX_CLIENT_VERSION = "0.157.1"
 
-_DEFAULT_USER_AGENT = f"codex_cli_rs/{_CODEX_CLIENT_VERSION}"
+_CLIENT_VERSION_ENV = "CODEX_PLUS_CLIENT_VERSION"
+
+
+def _default_client_version() -> str:
+    """Resolve the presented Codex client version at construction time.
+
+    Sent as ``?client_version=<v>`` and in the ``codex_cli_rs/<v>`` User-Agent,
+    paired with the ``codex_cli_rs`` originator so the backend admits
+    version-gated models.
+    """
+    return os.environ.get(_CLIENT_VERSION_ENV, "").strip() or _CODEX_CLIENT_VERSION
+
+
+def _default_user_agent() -> str:
+    return f"codex_cli_rs/{_default_client_version()}"
+
+
 _DEFAULT_ORIGINATOR = "codex_cli_rs"
 """Originator header value. Must be ``codex_cli_rs`` (the real Codex CLI
 identity) or the backend refuses newly-gated models. An earlier build used a
 distinct ``langchain_codex_plus`` label for telemetry separation, but that got
 those models rejected. Override the ``originator`` field only if you accept
 losing access to gated models."""
-
-_DEFAULT_CLIENT_VERSION = _CODEX_CLIENT_VERSION
-"""Sent as ``?client_version=<v>`` on every request. Paired with the
-``codex_cli_rs`` User-Agent + originator so the backend admits version-gated
-models. Override if Codex raises the floor."""
 
 _DEFAULT_TIMEOUT_SECONDS = 120.0
 
@@ -198,12 +212,15 @@ class ChatCodexPlus(BaseChatModel):
             "SystemMessages are concatenated into instructions."
         ),
     )
-    reasoning_effort: str = Field(
-        default="none",
+    reasoning_effort: str | None = Field(
+        default=None,
         description=(
-            "Reasoning effort level. For gpt-5.4: "
-            "'none' | 'low' | 'medium' | 'high' | 'xhigh'. "
-            "Cheaper to 'none' for short chat-style calls."
+            "Reasoning effort level, sent as ``reasoning.effort``. ``None`` "
+            "(the default) omits the field so the model uses its own "
+            "default. Supported values vary by model: gpt-5.4 accepts "
+            "'none' | 'low' | 'medium' | 'high' | 'xhigh'; gpt-6-astra "
+            "accepts 'low' | 'medium' | 'high' | 'xhigh' | 'max' and "
+            "rejects 'none'."
         ),
     )
     auth_file_path: Path | None = Field(
@@ -221,15 +238,18 @@ class ChatCodexPlus(BaseChatModel):
         ),
     )
     client_version: str = Field(
-        default=_DEFAULT_CLIENT_VERSION,
-        description="Value sent as ?client_version=<v> on each request.",
+        default_factory=_default_client_version,
+        description=(
+            "Value sent as ?client_version=<v> on each request. Defaults to "
+            "``$CODEX_PLUS_CLIENT_VERSION`` or the built-in Codex version."
+        ),
     )
     originator: str = Field(
         default=_DEFAULT_ORIGINATOR,
         description="Value sent as the 'originator' header.",
     )
     user_agent: str = Field(
-        default=_DEFAULT_USER_AGENT,
+        default_factory=_default_user_agent,
         description="Value sent as the 'User-Agent' header.",
     )
     timeout_seconds: float = Field(
