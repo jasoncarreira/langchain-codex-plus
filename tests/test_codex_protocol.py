@@ -34,7 +34,7 @@ def test_build_body_user_only():
     assert body["stream"] is True
     assert body["store"] is False
     assert body["instructions"] == ""
-    assert body["reasoning"] == {"effort": "none"}
+    assert "reasoning" not in body
     assert body["input"] == [
         {"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
     ]

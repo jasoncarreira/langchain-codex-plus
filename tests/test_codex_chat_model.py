@@ -103,7 +103,8 @@ def test_llm_type_and_identifying_params(auth_file):
     assert llm._llm_type == "codex-plus"
     params = llm._identifying_params
     assert params["model"] == "gpt-5.4"
-    assert params["reasoning_effort"] == "none"
+    # No default effort: the field is omitted so each model uses its own.
+    assert params["reasoning_effort"] is None
 
 
 def test_resolve_auth_raises_when_file_missing(tmp_path):
@@ -224,8 +225,42 @@ def test_generate_request_body_is_what_codex_expects(auth_file):
         ],
         "stream": True,
         "store": False,
-        "reasoning": {"effort": "none"},
     }
+
+
+def test_explicit_reasoning_effort_is_sent_verbatim(auth_file):
+    """An explicit effort, including model-specific values like ``max``, is
+    passed through unchanged; the server validates it per model."""
+    transport = _CaptureTransport(body=_ok_sse_body())
+    llm = _make_llm(auth_file, transport=transport, model="gpt-6-astra")
+    llm.reasoning_effort = "max"
+    llm.invoke([HumanMessage("hi")])
+    body = json.loads(transport.last_request.content)
+    assert body["reasoning"] == {"effort": "max"}
+
+
+def test_default_client_version_and_user_agent(auth_file, monkeypatch):
+    monkeypatch.delenv("CODEX_PLUS_CLIENT_VERSION", raising=False)
+    llm = ChatCodexPlus(auth_file_path=auth_file)
+    assert llm.client_version == "0.157.1"
+    assert llm.user_agent == "codex_cli_rs/0.157.1"
+
+
+def test_client_version_env_overrides_default(auth_file, monkeypatch):
+    monkeypatch.setenv("CODEX_PLUS_CLIENT_VERSION", " 0.999.0 ")
+    llm = ChatCodexPlus(auth_file_path=auth_file)
+    assert llm.client_version == "0.999.0"
+    assert llm.user_agent == "codex_cli_rs/0.999.0"
+    assert llm._request_url().endswith("?client_version=0.999.0")
+    # An explicit argument still wins over the environment.
+    explicit = ChatCodexPlus(auth_file_path=auth_file, client_version="1.2.3")
+    assert explicit.client_version == "1.2.3"
+
+
+def test_blank_client_version_env_uses_default(auth_file, monkeypatch):
+    monkeypatch.setenv("CODEX_PLUS_CLIENT_VERSION", "   ")
+    llm = ChatCodexPlus(auth_file_path=auth_file)
+    assert llm.client_version == "0.157.1"
 
 
 def test_generate_invokes_rate_limit_callback(auth_file):
