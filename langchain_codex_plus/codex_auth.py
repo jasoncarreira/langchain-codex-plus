@@ -33,8 +33,12 @@ References (verified against ``openai/codex`` source 2026-05-20):
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -324,7 +328,9 @@ def _write_auth_json(path: Path, auth: CodexAuth) -> None:
             auth.last_refresh.astimezone(UTC)
             .strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         )
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Unique per writer so two processes rewriting the file can't clobber
+    # each other's half-written temp file.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     try:
         tmp.chmod(0o600)
@@ -399,6 +405,156 @@ async def arefresh_codex_auth(
     if write_back:
         _write_auth_json(path or auth_file_path(), updated)
     return updated
+
+
+# ─── Coordinated refresh ────────────────────────────────────────────
+#
+# Refresh tokens are single-use: every refresh spends the current one and
+# the server may revoke the whole token family when a spent token is
+# presented again. Several consumers commonly share one ``auth.json``
+# (the Codex CLI/app, long-lived chat-model instances, other processes),
+# so a consumer must never refresh from a token it cached earlier.
+# ``refresh_codex_auth_coordinated`` re-reads the file under an exclusive
+# lock and adopts a rotation someone else already made instead of
+# refreshing again.
+
+LOCK_TIMEOUT_SECONDS = 60.0
+"""How long to wait for another refresher before proceeding without the
+lock. Longer than a refresh request's own 30s timeout."""
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _try_flock(fd: int) -> bool:
+    try:
+        import fcntl
+    except ImportError:  # Windows: no advisory locking, proceed unlocked.
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _unlock(fd: int) -> None:
+    with contextlib.suppress(ImportError, OSError):
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _open_lock(path: Path) -> int | None:
+    try:
+        return os.open(_lock_path(path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        # Read-only directory etc.: coordination is best-effort.
+        return None
+
+
+@contextlib.contextmanager
+def _auth_file_lock(path: Path) -> Iterator[None]:
+    fd = _open_lock(path)
+    try:
+        if fd is not None:
+            deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+            while not _try_flock(fd) and time.monotonic() < deadline:
+                time.sleep(0.05)
+        yield
+    finally:
+        if fd is not None:
+            _unlock(fd)
+            os.close(fd)
+
+
+@contextlib.asynccontextmanager
+async def _aauth_file_lock(path: Path):
+    fd = _open_lock(path)
+    try:
+        if fd is not None:
+            deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+            while not _try_flock(fd) and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+        yield
+    finally:
+        if fd is not None:
+            _unlock(fd)
+            os.close(fd)
+
+
+def _rotated_on_disk(stale: CodexAuth, path: Path) -> CodexAuth | None:
+    """Return the on-disk auth if it no longer matches ``stale``."""
+    current = load_codex_auth(path)
+    if current is not None and current.access_token != stale.access_token:
+        return current
+    return None
+
+
+def refresh_codex_auth_coordinated(
+    stale: CodexAuth,
+    *,
+    path: Path | None = None,
+    timeout_seconds: float = 30.0,
+    http_client: httpx.Client | None = None,
+) -> CodexAuth:
+    """Replace ``stale`` (an auth the server just rejected) with a
+    working one without ever presenting a spent refresh token.
+
+    Under an exclusive lock on ``<auth.json>.lock``: if the file already
+    holds a different access token, another consumer rotated it — adopt
+    that and skip the refresh. Otherwise refresh from the on-disk tokens
+    and write the result back. If the refresh fails, re-read once more
+    (a consumer that doesn't take the lock may have rotated in between)
+    before raising.
+    """
+    p = path or auth_file_path()
+    with _auth_file_lock(p):
+        rotated = _rotated_on_disk(stale, p)
+        if rotated is not None:
+            return rotated
+        current = load_codex_auth(p) or stale
+        try:
+            return refresh_codex_auth(
+                current,
+                path=p,
+                timeout_seconds=timeout_seconds,
+                http_client=http_client,
+            )
+        except CodexAuthRefreshError:
+            rotated = _rotated_on_disk(current, p)
+            if rotated is not None:
+                return rotated
+            raise
+
+
+async def arefresh_codex_auth_coordinated(
+    stale: CodexAuth,
+    *,
+    path: Path | None = None,
+    timeout_seconds: float = 30.0,
+    http_client: httpx.AsyncClient | None = None,
+) -> CodexAuth:
+    """Async sibling of :func:`refresh_codex_auth_coordinated`."""
+    p = path or auth_file_path()
+    async with _aauth_file_lock(p):
+        rotated = _rotated_on_disk(stale, p)
+        if rotated is not None:
+            return rotated
+        current = load_codex_auth(p) or stale
+        try:
+            return await arefresh_codex_auth(
+                current,
+                path=p,
+                timeout_seconds=timeout_seconds,
+                http_client=http_client,
+            )
+        except CodexAuthRefreshError:
+            rotated = _rotated_on_disk(current, p)
+            if rotated is not None:
+                return rotated
+            raise
 
 
 def _do_refresh_sync(

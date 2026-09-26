@@ -117,6 +117,26 @@ The package presents itself as Codex CLI `0.157.1`, which the backend uses to
 gate newer models. Set `CODEX_PLUS_CLIENT_VERSION` to present a newer version
 without waiting for a release; an explicit `client_version=` argument wins.
 
+## Sharing auth.json with other consumers
+
+Refresh tokens are single-use, and the server may revoke the whole token
+family when a spent one is presented again, logging out every consumer of
+`auth.json` at once. So on a 401 this package never refreshes from the token
+it cached at startup:
+
+1. Under an exclusive lock on `auth.json.lock`, it re-reads `auth.json`. If
+   another consumer (the Codex CLI or app, another process, another model
+   instance) already rotated the tokens, it adopts them and skips the refresh.
+2. Otherwise it refreshes from the on-disk tokens and writes the result back
+   atomically, so concurrent refreshers in any process that uses this package
+   refresh exactly once.
+3. If the refresh still fails, it re-reads once more before raising, in case a
+   consumer that doesn't take the lock rotated in between.
+
+The same behaviour is available directly as `refresh_codex_auth_coordinated` /
+`arefresh_codex_auth_coordinated`. The lock is advisory (`flock`); it doesn't
+coordinate with the Codex CLI itself, which is why step 3 exists.
+
 ## Rate-limit hook
 
 Every successful `/codex/responses` response carries quota headers
