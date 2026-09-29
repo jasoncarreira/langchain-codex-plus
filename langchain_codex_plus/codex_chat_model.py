@@ -124,7 +124,7 @@ logger = logging.getLogger(__name__)
 #: ``@openai/codex`` CLI version in deployments. Set
 #: ``CODEX_PLUS_CLIENT_VERSION`` to present a newer version without a release
 #: when the backend raises the floor again.
-_CODEX_CLIENT_VERSION = "0.157.1"
+_CODEX_CLIENT_VERSION = "0.159.1"
 
 _CLIENT_VERSION_ENV = "CODEX_PLUS_CLIENT_VERSION"
 
