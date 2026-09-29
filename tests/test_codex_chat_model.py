@@ -242,8 +242,8 @@ def test_explicit_reasoning_effort_is_sent_verbatim(auth_file):
 def test_default_client_version_and_user_agent(auth_file, monkeypatch):
     monkeypatch.delenv("CODEX_PLUS_CLIENT_VERSION", raising=False)
     llm = ChatCodexPlus(auth_file_path=auth_file)
-    assert llm.client_version == "0.157.1"
-    assert llm.user_agent == "codex_cli_rs/0.157.1"
+    assert llm.client_version == "0.159.1"
+    assert llm.user_agent == "codex_cli_rs/0.159.1"
 
 
 def test_client_version_env_overrides_default(auth_file, monkeypatch):
@@ -260,7 +260,7 @@ def test_client_version_env_overrides_default(auth_file, monkeypatch):
 def test_blank_client_version_env_uses_default(auth_file, monkeypatch):
     monkeypatch.setenv("CODEX_PLUS_CLIENT_VERSION", "   ")
     llm = ChatCodexPlus(auth_file_path=auth_file)
-    assert llm.client_version == "0.157.1"
+    assert llm.client_version == "0.159.1"
 
 
 def test_generate_invokes_rate_limit_callback(auth_file):

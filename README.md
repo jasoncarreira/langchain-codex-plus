@@ -110,11 +110,13 @@ llm.invoke("Count from 1 to 100", stop=["50"])
 model applies its own default. (Before 0.0.9 the default was `"none"`, which
 `gpt-6-astra` rejects; callers who relied on it and want minimal reasoning should
 now pass `reasoning_effort="none"` explicitly.) Accepted values are validated
-server-side per model, e.g. gpt-5.4 takes `none|low|medium|high|xhigh` and
-gpt-6-astra takes `low|medium|high|xhigh|max`.
+server-side per model, e.g. gpt-5.4 takes `none|low|medium|high|xhigh`,
+gpt-6-astra and gpt-6-sol take `low|medium|high|xhigh|max|ultra`, and the luna
+models take `low|medium|high|xhigh|max` (no `none`).
 
-The package presents itself as Codex CLI `0.157.1`, which the backend uses to
-gate newer models. Set `CODEX_PLUS_CLIENT_VERSION` to present a newer version
+The package presents itself as Codex CLI `0.159.1`, which the backend uses to
+gate newer models (for example, `gpt-6.1-sol` is only listed for clients
+`>= 0.159.0`). Set `CODEX_PLUS_CLIENT_VERSION` to present a newer version
 without waiting for a release; an explicit `client_version=` argument wins.
 
 ## Sharing auth.json with other consumers

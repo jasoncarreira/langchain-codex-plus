@@ -43,7 +43,7 @@ from typing import Any
 
 # Informational only: the server validates effort per model (gpt-6-astra adds
 # "max" and rejects "none"). This package does not enforce it.
-VALID_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
+VALID_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max", "ultra"})
 """For ``gpt-5.4``. Other models may accept different values; the
 chat model passes whatever the caller sets and lets the gateway
 validate (caller gets a clear 400 if it's wrong)."""
