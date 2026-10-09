@@ -99,6 +99,8 @@ from langchain_codex_plus.codex_protocol import (
     CodexCompletion,
     CodexResponseError,
     SseEvent,
+    ToolCallAssembler,
+    ToolCallFragment,
     ToolChoice,
     aparse_sse_stream,
     build_request_body,
@@ -882,7 +884,7 @@ class ChatCodexPlus(BaseChatModel):
                 # (see ``_yield_chunks_sync`` for the design rationale).
                 response_id: str | None = None
                 last_usage: dict[str, Any] | None = None
-                tool_call_index: dict[str, int] = {}
+                assembler = ToolCallAssembler()
                 # Same buffered stop-matching algorithm as the sync
                 # streaming path (see ``_yield_chunks_sync`` for the
                 # full rationale: hold back the trailing chars that
@@ -895,6 +897,8 @@ class ChatCodexPlus(BaseChatModel):
                 )
                 stopped_early = False
                 async for ev in events:
+                    for fragment in assembler.feed(ev):
+                        yield _tool_call_fragment_chunk(fragment, response_id)
                     if ev.event == "response.created":
                         resp = ev.data.get("response") or {}
                         if isinstance(resp, dict):
@@ -941,50 +945,6 @@ class ChatCodexPlus(BaseChatModel):
                             hold_buffer = combined[safe_emit_len:]
                         else:
                             hold_buffer = combined
-                    elif ev.event == "response.output_item.added":
-                        item = ev.data.get("item") or {}
-                        if (
-                            isinstance(item, dict)
-                            and item.get("type") == "function_call"
-                        ):
-                            item_id = item.get("id")
-                            if isinstance(item_id, str):
-                                idx = len(tool_call_index)
-                                tool_call_index[item_id] = idx
-                                yield ChatGenerationChunk(
-                                    message=AIMessageChunk(
-                                        content="",
-                                        id=response_id,
-                                        tool_call_chunks=[ToolCallChunk(
-                                            name=item.get("name"),
-                                            args=item.get("arguments") or "",
-                                            id=item.get("call_id") or "",
-                                            index=idx,
-                                            type="tool_call_chunk",
-                                        )],
-                                    )
-                                )
-                    elif ev.event == "response.function_call_arguments.delta":
-                        item_id = ev.data.get("item_id")
-                        delta = ev.data.get("delta")
-                        if (
-                            isinstance(item_id, str)
-                            and item_id in tool_call_index
-                            and isinstance(delta, str)
-                        ):
-                            yield ChatGenerationChunk(
-                                message=AIMessageChunk(
-                                    content="",
-                                    id=response_id,
-                                    tool_call_chunks=[ToolCallChunk(
-                                        name=None,
-                                        args=delta,
-                                        id=None,
-                                        index=tool_call_index[item_id],
-                                        type="tool_call_chunk",
-                                    )],
-                                )
-                            )
                     elif ev.event == "response.completed":
                         resp = ev.data.get("response") or {}
                         if isinstance(resp, dict):
@@ -1093,6 +1053,25 @@ def _tap_text_deltas_sync(
         yield ev
 
 
+def _tool_call_fragment_chunk(
+    fragment: ToolCallFragment, response_id: str | None,
+) -> ChatGenerationChunk:
+    """Wrap one assembler fragment as a LangChain tool-call chunk."""
+    return ChatGenerationChunk(
+        message=AIMessageChunk(
+            content="",
+            id=response_id,
+            tool_call_chunks=[ToolCallChunk(
+                name=fragment.name,
+                args=fragment.args,
+                id=fragment.call_id,
+                index=fragment.index,
+                type="tool_call_chunk",
+            )],
+        )
+    )
+
+
 def _yield_chunks_sync(
     events: Iterator[SseEvent],
     *,
@@ -1104,10 +1083,10 @@ def _yield_chunks_sync(
     Maps Codex SSE events to LangChain chunks:
 
     * ``response.output_text.delta`` → text content chunk
-    * ``response.output_item.added`` (function_call) → kickoff
-      ``ToolCallChunk`` carrying ``name`` + ``id``
-    * ``response.function_call_arguments.delta`` → ``ToolCallChunk``
-      with incremental ``args`` JSON fragment
+    * ``function_call`` items → ``ToolCallChunk``s from
+      :class:`ToolCallAssembler`: a kickoff carrying ``name`` + ``id``,
+      argument deltas, and any argument text that only the final
+      ``.done`` frames or the completed ``output`` array carry
     * ``response.completed`` → usage-bearing terminal chunk
 
     If ``stop`` is provided, the running text is checked after each
@@ -1117,11 +1096,10 @@ def _yield_chunks_sync(
     """
     response_id: str | None = None
     last_usage: dict[str, Any] | None = None
-    # Map Codex item_id → (chunk_index, call_id, name) so we can
-    # stamp the same ``index`` on each delta chunk for a given tool
-    # call. LangChain merges chunks with matching index to assemble
-    # the final ToolCall on the message reducer side.
-    tool_call_index: dict[str, int] = {}
+    # Assembles tool calls and reconciles streamed arguments against the
+    # final ``.done`` frames; every fragment carries the call's stable
+    # ``index`` so LangChain merges them into one ToolCall.
+    assembler = ToolCallAssembler()
     # Buffered stop-sequence matcher: ``text_so_far`` is what we've
     # already YIELDED to the caller; ``hold_buffer`` is text we've
     # received but held back in case it's the prefix of a stop seq
@@ -1130,6 +1108,8 @@ def _yield_chunks_sync(
     hold_buffer = ""
     max_stop_len = max((len(s) for s in stop), default=0) if stop else 0
     for ev in events:
+        for fragment in assembler.feed(ev):
+            yield _tool_call_fragment_chunk(fragment, response_id)
         if ev.event == "response.created":
             resp = ev.data.get("response") or {}
             if isinstance(resp, dict):
@@ -1184,47 +1164,6 @@ def _yield_chunks_sync(
                 hold_buffer = combined[safe_emit_len:]
             else:
                 hold_buffer = combined
-        elif ev.event == "response.output_item.added":
-            item = ev.data.get("item") or {}
-            if isinstance(item, dict) and item.get("type") == "function_call":
-                item_id = item.get("id")
-                if isinstance(item_id, str):
-                    idx = len(tool_call_index)
-                    tool_call_index[item_id] = idx
-                    yield ChatGenerationChunk(
-                        message=AIMessageChunk(
-                            content="",
-                            id=response_id,
-                            tool_call_chunks=[ToolCallChunk(
-                                name=item.get("name"),
-                                args=item.get("arguments") or "",
-                                id=item.get("call_id") or "",
-                                index=idx,
-                                type="tool_call_chunk",
-                            )],
-                        )
-                    )
-        elif ev.event == "response.function_call_arguments.delta":
-            item_id = ev.data.get("item_id")
-            delta = ev.data.get("delta")
-            if (
-                isinstance(item_id, str)
-                and item_id in tool_call_index
-                and isinstance(delta, str)
-            ):
-                yield ChatGenerationChunk(
-                    message=AIMessageChunk(
-                        content="",
-                        id=response_id,
-                        tool_call_chunks=[ToolCallChunk(
-                            name=None,
-                            args=delta,
-                            id=None,
-                            index=tool_call_index[item_id],
-                            type="tool_call_chunk",
-                        )],
-                    )
-                )
         elif ev.event == "response.completed":
             resp = ev.data.get("response") or {}
             if isinstance(resp, dict):
