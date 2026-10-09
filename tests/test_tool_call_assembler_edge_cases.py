@@ -153,3 +153,51 @@ def test_first_final_frame_wins_over_later_frames():
     ])
     calls = consume_events(events).tool_calls
     assert [c.arguments_json for c in calls] == [ARGS_B]
+
+
+def _calls(events):
+    return [(c.call_id, c.name, c.arguments_json)
+            for c in consume_events(_events(events)).tool_calls]
+
+
+def _done_without_id(call_id, name, args, output_index):
+    return ("response.output_item.done", {
+        "output_index": output_index,
+        "item": {"type": "function_call", "call_id": call_id, "name": name,
+                 "arguments": args},
+    })
+
+
+def test_completed_only_calls_without_item_ids_are_kept():
+    assert _calls([_completed([
+        {"type": "function_call", "call_id": "call_a", "name": "pr_metadata",
+         "arguments": ARGS_A},
+        {"type": "function_call", "call_id": "call_b", "name": "ls",
+         "arguments": ARGS_B},
+    ])]) == [("call_a", "pr_metadata", ARGS_A), ("call_b", "ls", ARGS_B)]
+
+
+def test_item_done_only_calls_without_item_ids_are_kept():
+    assert _calls([
+        _done_without_id("call_a", "pr_metadata", ARGS_A, 0),
+        _done_without_id("call_b", "ls", ARGS_B, 1),
+        _completed(),
+    ]) == [("call_a", "pr_metadata", ARGS_A), ("call_b", "ls", ARGS_B)]
+
+
+def test_call_id_on_item_done_after_arguments_done_is_kept(auth_file):
+    """The server normally sends arguments.done before output_item.done; a
+    call_id that only the latter carries must still reach every consumer."""
+    events = [
+        _added("fc_a", None, "ls", 0),
+        ("response.function_call_arguments.done",
+         {"item_id": "fc_a", "output_index": 0, "arguments": ARGS_B}),
+        _done("fc_a", "call_a", "ls", ARGS_B, 0),
+        _completed(),
+    ]
+    assert _calls(events) == [("call_a", "ls", ARGS_B)]
+    llm = _make_llm(auth_file, transport=_CaptureTransport(body=_sse_bytes(events)))
+    merged = None
+    for chunk in llm.stream([HumanMessage("go")]):
+        merged = chunk if merged is None else merged + chunk
+    assert [(c["id"], c["args"]) for c in merged.tool_calls] == [("call_a", {"path": "/tmp"})]

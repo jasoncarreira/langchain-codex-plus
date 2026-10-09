@@ -748,7 +748,8 @@ class ToolCallAssembler:
     ) -> dict[str, Any]:
         record = {
             "index": len(self._calls),
-            "id": item_id,
+            "key": item_id,
+            "id": str(item.get("id") or ""),
             "call_id": str(item.get("call_id") or ""),
             "name": str(item.get("name") or ""),
             "arguments": "",
@@ -825,21 +826,30 @@ class ToolCallAssembler:
         if not isinstance(arguments, str):
             return []
         if record is None:
-            if not isinstance(item_id, str) or not item_id or item is None:
+            if item is None or not (item.get("call_id") or item.get("name")):
                 return []
-            record = self._register(item_id, item, output_index)
+            # Key by item id, then call_id, then position in emission order;
+            # a call without an item id is still a call (0.0.11 kept them).
+            key = (item_id if isinstance(item_id, str) and item_id
+                   else f"call:{item['call_id']}" if item.get("call_id")
+                   else f"#{len(self._calls)}")
+            record = self._register(key, item, output_index)
             record["arguments"] = arguments
             record["final"] = True
             return [self._fragment(record, arguments)]
-        # The first final frame is authoritative; later frames never rewrite
-        # a finished call.
-        if record["final"]:
-            return []
         if item is not None:
+            # Backfill identity the earlier frames lacked, even after the
+            # arguments are final (arguments.done normally precedes
+            # output_item.done).
             if not record["call_id"] and item.get("call_id"):
                 record["call_id"] = str(item["call_id"])
-                self._by_call_id[record["call_id"]] = record["id"]
+                self._by_call_id[record["call_id"]] = record["key"]
             record["name"] = record["name"] or str(item.get("name") or "")
+        # The first final frame is authoritative for the arguments; later
+        # frames never rewrite a finished call.
+        if record["final"]:
+            fragment = self._fragment(record, "")
+            return [fragment] if fragment.name or fragment.call_id else []
         seen = record["arguments"]
         record["final"] = True
         record["arguments"] = arguments
