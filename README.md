@@ -75,6 +75,13 @@ Send tool results back via `ToolMessage(content=..., tool_call_id=...)` —
 the protocol layer serializes them as Codex `function_call_output`
 entries.
 
+Arguments are assembled from `response.function_call_arguments.delta`
+fragments, then reconciled against the authoritative final frames:
+`response.function_call_arguments.done`, `response.output_item.done` and the
+`response.completed` `output` array. Codex can deliver parallel calls'
+arguments only in those final frames (observed from 2026-10-06), so a
+delta-only reader would see empty arguments.
+
 ## Multimodal
 
 `HumanMessage` content can be a list mixing text and image blocks:

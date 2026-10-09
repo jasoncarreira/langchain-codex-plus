@@ -703,6 +703,169 @@ def first_stop_match(text: str, stops: list[str]) -> int | None:
     return best
 
 
+@dataclass(frozen=True)
+class ToolCallFragment:
+    """One incremental update to a streamed tool call.
+
+    Streaming callers turn each fragment into a LangChain ``ToolCallChunk``
+    with the same ``index``. LangChain concatenates ``args`` across chunks
+    that share an index, so a fragment only ever carries *new* argument text.
+    """
+
+    index: int
+    name: str | None
+    call_id: str | None
+    args: str
+
+
+class ToolCallAssembler:
+    """Assemble ``function_call`` items from Codex SSE events.
+
+    Codex can deliver a call's arguments three ways: as
+    ``response.function_call_arguments.delta`` fragments, in the final
+    ``response.function_call_arguments.done`` / ``response.output_item.done``
+    frames, or only in the ``response.completed`` ``output`` array. Since
+    2026-10-06, parallel calls often arrive without usable deltas, which the
+    delta-only parser turned into empty arguments. The final frames are
+    authoritative. This assembler appends deltas as they come, then
+    reconciles every call against its final arguments, emitting only the
+    text the caller has not seen yet.
+
+    Calls are matched by item id, falling back to ``output_index`` when a
+    frame's item id is missing or unknown.
+    """
+
+    def __init__(self) -> None:
+        self._calls: dict[str, dict[str, Any]] = {}
+        self._by_output_index: dict[int, str] = {}
+
+    def _register(
+        self, item_id: str, item: dict[str, Any], output_index: Any,
+    ) -> dict[str, Any]:
+        record = {
+            "index": len(self._calls),
+            "id": item_id,
+            "call_id": str(item.get("call_id") or ""),
+            "name": str(item.get("name") or ""),
+            "arguments": "",
+            "final": False,
+        }
+        self._calls[item_id] = record
+        if isinstance(output_index, int):
+            self._by_output_index[output_index] = item_id
+        return record
+
+    def _lookup(self, item_id: Any, output_index: Any) -> dict[str, Any] | None:
+        if isinstance(item_id, str) and item_id in self._calls:
+            return self._calls[item_id]
+        if isinstance(output_index, int) and output_index in self._by_output_index:
+            return self._calls[self._by_output_index[output_index]]
+        return None
+
+    def added(self, data: dict[str, Any]) -> list[ToolCallFragment]:
+        """Handle ``response.output_item.added``."""
+        item = data.get("item") or {}
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            return []
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or item_id in self._calls:
+            return []
+        record = self._register(item_id, item, data.get("output_index"))
+        initial = item.get("arguments")
+        initial = initial if isinstance(initial, str) else ""
+        record["arguments"] = initial
+        return [ToolCallFragment(record["index"], record["name"] or None,
+                                 record["call_id"] or None, initial)]
+
+    def delta(self, data: dict[str, Any]) -> list[ToolCallFragment]:
+        """Handle ``response.function_call_arguments.delta``."""
+        delta = data.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return []
+        record = self._lookup(data.get("item_id"), data.get("output_index"))
+        if record is None or record["final"]:
+            return []
+        record["arguments"] += delta
+        return [ToolCallFragment(record["index"], None, None, delta)]
+
+    def _finalize(self, item_id: Any, output_index: Any, arguments: Any,
+                  item: dict[str, Any] | None) -> list[ToolCallFragment]:
+        if not isinstance(arguments, str):
+            return []
+        record = self._lookup(item_id, output_index)
+        if record is None:
+            if not isinstance(item_id, str) or not item_id or item is None:
+                return []
+            record = self._register(item_id, item, output_index)
+            record["arguments"] = arguments
+            record["final"] = True
+            return [ToolCallFragment(record["index"], record["name"] or None,
+                                     record["call_id"] or None, arguments)]
+        if item is not None:
+            record["call_id"] = record["call_id"] or str(item.get("call_id") or "")
+            record["name"] = record["name"] or str(item.get("name") or "")
+        seen = record["arguments"]
+        record["final"] = True
+        if arguments == seen:
+            return []
+        record["arguments"] = arguments
+        if arguments.startswith(seen):
+            remainder = arguments[len(seen):]
+            return [ToolCallFragment(record["index"], None, None, remainder)]
+        # The streamed text disagrees with the final arguments. A streamed
+        # chunk cannot be retracted, so streaming callers keep what they saw;
+        # ``tool_calls()`` (the non-streaming path) uses the final arguments.
+        record["diverged"] = True
+        return []
+
+    def arguments_done(self, data: dict[str, Any]) -> list[ToolCallFragment]:
+        """Handle ``response.function_call_arguments.done``."""
+        return self._finalize(data.get("item_id"), data.get("output_index"),
+                              data.get("arguments"), None)
+
+    def item_done(self, data: dict[str, Any]) -> list[ToolCallFragment]:
+        """Handle ``response.output_item.done``."""
+        item = data.get("item") or {}
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            return []
+        return self._finalize(item.get("id"), data.get("output_index"),
+                              item.get("arguments"), item)
+
+    def completed(self, response: dict[str, Any]) -> list[ToolCallFragment]:
+        """Reconcile against the ``output`` array of ``response.completed``."""
+        fragments: list[ToolCallFragment] = []
+        output = response.get("output") if isinstance(response, dict) else None
+        for position, item in enumerate(output or []):
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                continue
+            fragments.extend(self._finalize(item.get("id"), position,
+                                            item.get("arguments"), item))
+        return fragments
+
+    def feed(self, event: SseEvent) -> list[ToolCallFragment]:
+        """Dispatch one SSE event; non-tool events return no fragments."""
+        handler = {
+            "response.output_item.added": self.added,
+            "response.function_call_arguments.delta": self.delta,
+            "response.function_call_arguments.done": self.arguments_done,
+            "response.output_item.done": self.item_done,
+        }.get(event.event)
+        if handler is not None:
+            return handler(event.data)
+        if event.event == "response.completed":
+            response = event.data.get("response")
+            return self.completed(response) if isinstance(response, dict) else []
+        return []
+
+    def tool_calls(self) -> list[CodexToolCall]:
+        """Return the assembled calls in emission order."""
+        return [
+            CodexToolCall(id=record["id"], call_id=record["call_id"],
+                          name=record["name"], arguments_json=record["arguments"])
+            for record in sorted(self._calls.values(), key=lambda r: r["index"])
+        ]
+
+
 def consume_events(
     events: Iterable[SseEvent],
     *,
@@ -710,9 +873,10 @@ def consume_events(
 ) -> CodexCompletion:
     """Drain the SSE event stream and return the final completion.
 
-    Tracks text deltas to build a final concatenated text and collects
-    tool calls from ``response.output_item.added`` (initial frame) +
-    ``response.function_call_arguments.delta`` (argument fragments).
+    Tracks text deltas to build a final concatenated text and assembles
+    tool calls with :class:`ToolCallAssembler`. Argument deltas are
+    reconciled against the final ``.done`` frames and the completed
+    ``output`` array, which are authoritative.
 
     Raises :class:`CodexResponseError` if a ``response.error`` event
     arrives or if the stream ends without a ``response.completed``.
@@ -730,12 +894,12 @@ def consume_events(
     text_parts: list[str] = []
     completed_response: dict[str, Any] | None = None
     early_stop_text: str | None = None
-    # In-progress tool calls, keyed by Codex's item_id (``fc-...``).
-    # Each entry tracks call_id + name (from output_item.added) and
-    # accumulates argument fragments (from arguments.delta events).
-    pending_tool_calls: dict[str, dict[str, Any]] = {}
+    # Tool calls assembled from deltas and reconciled against the final
+    # ``.done`` frames and the completed ``output`` array.
+    assembler = ToolCallAssembler()
 
     for evt in events:
+        assembler.feed(evt)
         if evt.event == "response.created":
             resp = evt.data.get("response", {})
             if isinstance(resp, dict):
@@ -750,26 +914,6 @@ def consume_events(
                     if match_idx is not None:
                         early_stop_text = accumulated[:match_idx]
                         break
-        elif evt.event == "response.output_item.added":
-            item = evt.data.get("item") or {}
-            if isinstance(item, dict) and item.get("type") == "function_call":
-                item_id = item.get("id")
-                if isinstance(item_id, str):
-                    pending_tool_calls[item_id] = {
-                        "id": item_id,
-                        "call_id": item.get("call_id") or "",
-                        "name": item.get("name") or "",
-                        "arguments": item.get("arguments") or "",
-                    }
-        elif evt.event == "response.function_call_arguments.delta":
-            item_id = evt.data.get("item_id")
-            delta = evt.data.get("delta")
-            if (
-                isinstance(item_id, str)
-                and isinstance(delta, str)
-                and item_id in pending_tool_calls
-            ):
-                pending_tool_calls[item_id]["arguments"] += delta
         elif evt.event == "response.completed":
             resp = evt.data.get("response", {})
             if isinstance(resp, dict):
@@ -792,15 +936,7 @@ def consume_events(
     # ``stopped_at_client`` marker so callers can distinguish it from a
     # natural completion.
     if early_stop_text is not None:
-        tool_calls = [
-            CodexToolCall(
-                id=tc["id"],
-                call_id=tc["call_id"],
-                name=tc["name"],
-                arguments_json=tc["arguments"],
-            )
-            for tc in pending_tool_calls.values()
-        ]
+        tool_calls = assembler.tool_calls()
         return CodexCompletion(
             response_id=response_id,
             final_text=early_stop_text,
@@ -822,20 +958,10 @@ def consume_events(
             raw={"partial_text": "".join(text_parts)},
         )
 
-    # Tool calls from the stream first; fall back to walking the
-    # ``output`` array on the completed event (defensive — covers
-    # responses where the gateway elided per-event signals).
-    tool_calls = [
-        CodexToolCall(
-            id=tc["id"],
-            call_id=tc["call_id"],
-            name=tc["name"],
-            arguments_json=tc["arguments"],
-        )
-        for tc in pending_tool_calls.values()
-    ]
-    if not tool_calls:
-        tool_calls = _extract_tool_calls_from_output(completed_response)
+    # The assembler has already reconciled every call against the
+    # ``.done`` frames and the completed ``output`` array, including calls
+    # that only appear there.
+    tool_calls = assembler.tool_calls()
 
     final_text = "".join(text_parts) or _extract_final_text(completed_response)
     usage = completed_response.get("usage")
@@ -846,27 +972,6 @@ def consume_events(
         usage=usage if isinstance(usage, dict) else None,
         raw_response=completed_response,
     )
-
-
-def _extract_tool_calls_from_output(
-    response_obj: dict[str, Any],
-) -> list[CodexToolCall]:
-    """Fallback for when the SSE stream didn't carry per-event signals.
-    Walk the ``output`` array on the completed response and pull out
-    any ``function_call`` items."""
-    out: list[CodexToolCall] = []
-    for item in response_obj.get("output") or []:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") != "function_call":
-            continue
-        out.append(CodexToolCall(
-            id=str(item.get("id") or ""),
-            call_id=str(item.get("call_id") or ""),
-            name=str(item.get("name") or ""),
-            arguments_json=str(item.get("arguments") or ""),
-        ))
-    return out
 
 
 def _extract_final_text(response_obj: dict[str, Any]) -> str:
