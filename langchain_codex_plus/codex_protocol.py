@@ -731,13 +731,17 @@ class ToolCallAssembler:
     reconciles every call against its final arguments, emitting only the
     text the caller has not seen yet.
 
-    Calls are matched by item id, falling back to ``output_index`` when a
-    frame's item id is missing or unknown.
+    Calls are matched by item id, then ``call_id``, then ``output_index``.
+    The first final frame wins: later frames never rewrite a finished call.
+    ``response.output_item.done`` is the server's contract (the official
+    codex-rs client builds calls from it alone); deltas are an optimisation
+    and the completed ``output`` array is a last-resort backstop.
     """
 
     def __init__(self) -> None:
         self._calls: dict[str, dict[str, Any]] = {}
         self._by_output_index: dict[int, str] = {}
+        self._by_call_id: dict[str, str] = {}
 
     def _register(
         self, item_id: str, item: dict[str, Any], output_index: Any,
@@ -749,18 +753,41 @@ class ToolCallAssembler:
             "name": str(item.get("name") or ""),
             "arguments": "",
             "final": False,
+            # What the caller has already been told, so a later fragment
+            # supplies name/call_id only if the kickoff lacked them
+            # (LangChain concatenates repeated non-empty strings).
+            "emitted_name": False,
+            "emitted_call_id": False,
         }
         self._calls[item_id] = record
         if isinstance(output_index, int):
             self._by_output_index[output_index] = item_id
+        if record["call_id"]:
+            self._by_call_id[record["call_id"]] = item_id
         return record
 
-    def _lookup(self, item_id: Any, output_index: Any) -> dict[str, Any] | None:
+    def _lookup(
+        self, item_id: Any, call_id: Any, output_index: Any,
+    ) -> dict[str, Any] | None:
+        """Match by item id, then ``call_id``, then ``output_index``."""
         if isinstance(item_id, str) and item_id in self._calls:
             return self._calls[item_id]
+        if isinstance(call_id, str) and call_id in self._by_call_id:
+            return self._calls[self._by_call_id[call_id]]
         if isinstance(output_index, int) and output_index in self._by_output_index:
             return self._calls[self._by_output_index[output_index]]
         return None
+
+    def _fragment(self, record: dict[str, Any], args: str) -> ToolCallFragment:
+        name = None
+        if record["name"] and not record["emitted_name"]:
+            name = record["name"]
+            record["emitted_name"] = True
+        call_id = None
+        if record["call_id"] and not record["emitted_call_id"]:
+            call_id = record["call_id"]
+            record["emitted_call_id"] = True
+        return ToolCallFragment(record["index"], name, call_id, args)
 
     def added(self, data: dict[str, Any]) -> list[ToolCallFragment]:
         """Handle ``response.output_item.added``."""
@@ -774,44 +801,54 @@ class ToolCallAssembler:
         initial = item.get("arguments")
         initial = initial if isinstance(initial, str) else ""
         record["arguments"] = initial
-        return [ToolCallFragment(record["index"], record["name"] or None,
-                                 record["call_id"] or None, initial)]
+        return [self._fragment(record, initial)]
 
     def delta(self, data: dict[str, Any]) -> list[ToolCallFragment]:
         """Handle ``response.function_call_arguments.delta``."""
         delta = data.get("delta")
         if not isinstance(delta, str) or not delta:
             return []
-        record = self._lookup(data.get("item_id"), data.get("output_index"))
+        record = self._lookup(data.get("item_id"), None, data.get("output_index"))
         if record is None or record["final"]:
             return []
         record["arguments"] += delta
-        return [ToolCallFragment(record["index"], None, None, delta)]
+        return [self._fragment(record, delta)]
 
-    def _finalize(self, item_id: Any, output_index: Any, arguments: Any,
-                  item: dict[str, Any] | None) -> list[ToolCallFragment]:
+    def _finalize(
+        self,
+        record: dict[str, Any] | None,
+        item_id: Any,
+        output_index: Any,
+        arguments: Any,
+        item: dict[str, Any] | None,
+    ) -> list[ToolCallFragment]:
         if not isinstance(arguments, str):
             return []
-        record = self._lookup(item_id, output_index)
         if record is None:
             if not isinstance(item_id, str) or not item_id or item is None:
                 return []
             record = self._register(item_id, item, output_index)
             record["arguments"] = arguments
             record["final"] = True
-            return [ToolCallFragment(record["index"], record["name"] or None,
-                                     record["call_id"] or None, arguments)]
+            return [self._fragment(record, arguments)]
+        # The first final frame is authoritative; later frames never rewrite
+        # a finished call.
+        if record["final"]:
+            return []
         if item is not None:
-            record["call_id"] = record["call_id"] or str(item.get("call_id") or "")
+            if not record["call_id"] and item.get("call_id"):
+                record["call_id"] = str(item["call_id"])
+                self._by_call_id[record["call_id"]] = record["id"]
             record["name"] = record["name"] or str(item.get("name") or "")
         seen = record["arguments"]
         record["final"] = True
-        if arguments == seen:
-            return []
         record["arguments"] = arguments
         if arguments.startswith(seen):
             remainder = arguments[len(seen):]
-            return [ToolCallFragment(record["index"], None, None, remainder)]
+            fragment = self._fragment(record, remainder)
+            if remainder or fragment.name or fragment.call_id:
+                return [fragment]
+            return []
         # The streamed text disagrees with the final arguments. A streamed
         # chunk cannot be retracted, so streaming callers keep what they saw;
         # ``tool_calls()`` (the non-streaming path) uses the final arguments.
@@ -820,25 +857,37 @@ class ToolCallAssembler:
 
     def arguments_done(self, data: dict[str, Any]) -> list[ToolCallFragment]:
         """Handle ``response.function_call_arguments.done``."""
-        return self._finalize(data.get("item_id"), data.get("output_index"),
+        record = self._lookup(data.get("item_id"), None, data.get("output_index"))
+        return self._finalize(record, data.get("item_id"), data.get("output_index"),
                               data.get("arguments"), None)
 
     def item_done(self, data: dict[str, Any]) -> list[ToolCallFragment]:
-        """Handle ``response.output_item.done``."""
+        """Handle ``response.output_item.done``, the server's contract frame."""
         item = data.get("item") or {}
         if not isinstance(item, dict) or item.get("type") != "function_call":
             return []
-        return self._finalize(item.get("id"), data.get("output_index"),
+        record = self._lookup(item.get("id"), item.get("call_id"),
+                              data.get("output_index"))
+        return self._finalize(record, item.get("id"), data.get("output_index"),
                               item.get("arguments"), item)
 
     def completed(self, response: dict[str, Any]) -> list[ToolCallFragment]:
-        """Reconcile against the ``output`` array of ``response.completed``."""
-        fragments: list[ToolCallFragment] = []
+        """Backstop from the ``output`` array of ``response.completed``.
+
+        Matches only by item id or ``call_id``: list positions are not
+        trusted here. New calls are registered only when the stream itself
+        registered none, the case this fallback has always covered.
+        """
         output = response.get("output") if isinstance(response, dict) else None
-        for position, item in enumerate(output or []):
+        allow_new = not self._calls
+        fragments: list[ToolCallFragment] = []
+        for item in output or []:
             if not isinstance(item, dict) or item.get("type") != "function_call":
                 continue
-            fragments.extend(self._finalize(item.get("id"), position,
+            record = self._lookup(item.get("id"), item.get("call_id"), None)
+            if record is None and not allow_new:
+                continue
+            fragments.extend(self._finalize(record, item.get("id"), None,
                                             item.get("arguments"), item))
         return fragments
 
